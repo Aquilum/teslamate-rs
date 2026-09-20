@@ -3,9 +3,11 @@ mod auth;
 mod auth_http;
 mod db;
 mod import;
+mod invoices;
 mod logger;
 mod mock;
 mod pam_auth;
+mod refresh;
 mod seed;
 mod server;
 mod sql;
@@ -67,6 +69,14 @@ enum Cmd {
         #[arg(long, env = "TESLAMATE_RS_AUTH")]
         auth: Option<String>,
     },
+    /// Pull Tesla Supercharger invoices (account API; does not wake the car)
+    SyncInvoices {
+        /// Force OAuth refresh, list vehicles, and walk every history page
+        #[arg(long)]
+        full: bool,
+    },
+    /// TeslaMate-style Owner API read sweep (no wake_up; vehicle_data only if already online)
+    Refresh,
     /// Store an Owner API refresh token and register vehicles
     Login {
         #[arg(long)]
@@ -175,10 +185,26 @@ async fn main() -> Result<()> {
                 let db2 = db.clone();
                 tokio::spawn(async move { logger::run(db2).await });
             }
+            if invoices::enabled() {
+                let db3 = db.clone();
+                tokio::spawn(async move { invoices::run(db3).await });
+            }
             let addr: SocketAddr = format!("{bind}:{port}").parse()?;
             let backend = auth::resolve_password_backend(auth.as_deref())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             server::serve(db, addr, backend).await?;
+        }
+        Cmd::SyncInvoices { full } => {
+            let stats = invoices::sync_once_opts(&db, full).await?;
+            println!(
+                "charging invoices pages={} fetched={} stored={} matched={} cost_updated={}",
+                stats.pages, stats.fetched, stats.stored, stats.matched, stats.cost_updated
+            );
+        }
+        Cmd::Refresh => {
+            for line in refresh::run(&db).await? {
+                println!("{line}");
+            }
         }
         Cmd::Login { refresh_token } => {
             logger::login(&db, &refresh_token).await?;

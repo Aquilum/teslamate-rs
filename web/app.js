@@ -5,6 +5,12 @@ let currentPath = "overview.json";
 let currentDash = null;
 let settings = {};
 let cars = [];
+let dashGen = 0;
+let dashAbort = null;
+
+function isAbort(e) {
+  return !!(e && (e.name === "AbortError" || e.code === 20));
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,6 +49,27 @@ function parseGrafanaTimeFrom(rel, toMs) {
   return d.getTime();
 }
 
+function autoInterval(fromMs, toMs) {
+  const range = Math.max(1, (toMs - fromMs) / 1000);
+  const need = Math.max(5, range / 1600);
+  const steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 259200, 604800];
+  const secs = steps.find((s) => s >= need) || Math.ceil(need);
+  if (secs % 86400 === 0) return `${secs / 86400}d`;
+  if (secs % 3600 === 0) return `${secs / 3600}h`;
+  if (secs % 60 === 0) return `${secs / 60}m`;
+  return `${secs}s`;
+}
+
+function downsampleRows(rows, maxPts) {
+  if (!rows || rows.length <= maxPts) return rows;
+  const step = Math.ceil(rows.length / maxPts);
+  const out = [];
+  for (let i = 0; i < rows.length; i += step) out.push(rows[i]);
+  const last = rows[rows.length - 1];
+  if (out[out.length - 1] !== last) out.push(last);
+  return out;
+}
+
 function withPanelTime(v, panel) {
   const from = parseGrafanaTimeFrom(panel?.timeFrom, v.to_ms);
   if (from == null) return v;
@@ -62,13 +89,23 @@ function vars() {
     preferred_range: settings.preferred_range || "rated",
     pressure_unit: settings.unit_of_pressure || "bar",
     speed_unit: length === "mi" ? "mph" : "kmh",
-    interval: "1h",
+    interval: autoInterval(from.getTime(), to.getTime()),
     extras: Object.fromEntries(new URLSearchParams(location.search)),
   };
 }
 
 async function api(path, opts) {
-  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  let r;
+  try {
+    r = await fetch(path, { credentials: "same-origin", ...opts });
+  } catch (e) {
+    if (opts?.signal?.aborted || isAbort(e)) {
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      throw err;
+    }
+    throw e;
+  }
   if (r.status === 401) {
     await tmAuth.route(await tmAuth.status());
     throw new Error("sign in required");
@@ -105,39 +142,125 @@ function renderNav() {
 }
 
 async function loadDashboard(path) {
+  const gen = ++dashGen;
+  dashAbort?.abort();
+  dashAbort = new AbortController();
+  const { signal } = dashAbort;
   currentPath = path;
   renderNav();
-  const dash = await api("/api/dashboards/" + path);
-  currentDash = dash;
-  $("title").textContent = dash.title || path;
-  const panels = flattenPanels(dash.panels);
-  const maxY = panels.reduce((m, p) => {
-    const g = p.gridPos || { y: 0, h: 8 };
-    return Math.max(m, g.y + g.h);
-  }, 8);
-  const board = $("board");
-  board.style.height = maxY * ROW_H + 24 + "px";
-  board.innerHTML = "";
-  const v = vars();
-  for (const panel of panels) {
-    const el = document.createElement("div");
-    const g = panel.gridPos || { x: 0, y: 0, w: 24, h: 8 };
-    el.className =
-      "panel" +
-      (panel.type === "row" ? " row-header" : "") +
-      (g.h <= 3 ? " compact" : "") +
-      (panel.type === "stat" || panel.type === "gauge" ? " panel-kpi" : "");
-    el.style.left = (g.x / COLS) * 100 + "%";
-    el.style.width = (g.w / COLS) * 100 + "%";
-    el.style.top = g.y * ROW_H + "px";
-    el.style.height = g.h * ROW_H - 6 + "px";
-    el.innerHTML = `<h3>${escapeHtml(interpTitle(panel.title || "", v, panel))}</h3><div class="body"></div>`;
-    board.appendChild(el);
-    fillPanel(el.querySelector(".body"), panel, v);
+  try {
+    const dash = await api("/api/dashboards/" + path, { signal });
+    if (gen !== dashGen) return;
+    currentDash = dash;
+    $("title").textContent = dash.title || path;
+    const panels = flattenPanels(dash.panels);
+    const maxY = panels.reduce((m, p) => {
+      const g = p.gridPos || { y: 0, h: 8 };
+      return Math.max(m, g.y + g.h);
+    }, 8);
+    const board = $("board");
+    board.style.height = maxY * ROW_H + 24 + "px";
+    board.innerHTML = "";
+    const v = vars();
+    for (const panel of panels) {
+      if (gen !== dashGen) return;
+      const el = document.createElement("div");
+      const g = panel.gridPos || { x: 0, y: 0, w: 24, h: 8 };
+      el.className =
+        "panel" +
+        (panel.type === "row" ? " row-header" : "") +
+        (g.h <= 3 ? " compact" : "") +
+        (panel.type === "stat" || panel.type === "gauge" ? " panel-kpi" : "");
+      el.style.left = (g.x / COLS) * 100 + "%";
+      el.style.width = (g.w / COLS) * 100 + "%";
+      el.style.top = g.y * ROW_H + "px";
+      el.style.height = g.h * ROW_H - 6 + "px";
+      el.innerHTML = `<h3>${escapeHtml(interpTitle(panel.title || "", v, panel))}</h3><div class="body"></div>`;
+      board.appendChild(el);
+      fillPanel(el.querySelector(".body"), panel, v, { gen, signal });
+    }
+  } catch (e) {
+    if (isAbort(e) || gen !== dashGen) return;
+    $("board").innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
   }
 }
 
-async function fillPanel(body, panel, v) {
+function stale(ctl) {
+  return ctl.gen != null && ctl.gen !== dashGen;
+}
+
+function attachIds(q, sql) {
+  if (/drive_id|charging_process_id/.test(sql || "")) {
+    const params = new URLSearchParams(location.search);
+    if (params.get("drive_id")) q.drive_id = Number(params.get("drive_id"));
+    if (params.get("charging_process_id")) q.charging_process_id = Number(params.get("charging_process_id"));
+  }
+  return q;
+}
+
+async function queryPanelSql(sql, v, panel, ctl, extra = {}) {
+  const q = attachIds({ sql, ...withPanelTime(v, panel), ...extra }, sql);
+  const data = await api("/api/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(q),
+    signal: ctl.signal,
+  });
+  if (stale(ctl) || (data && data.cancelled)) {
+    const err = new Error("aborted");
+    err.name = "AbortError";
+    throw err;
+  }
+  return data;
+}
+
+const PREVIEW_TRACK_SQL = `SELECT latitude, longitude FROM (
+  SELECT p.latitude AS latitude, p.longitude AS longitude, d.start_date AS sort_date, 0 AS seq
+  FROM drives d
+  JOIN positions p ON p.id = d.start_position_id
+  WHERE d.car_id = $car_id AND $__timeFilter(d.start_date)
+  UNION ALL
+  SELECT p.latitude, p.longitude, COALESCE(d.end_date, d.start_date), 1
+  FROM drives d
+  JOIN positions p ON p.id = d.end_position_id
+  WHERE d.car_id = $car_id AND $__timeFilter(d.start_date)
+) ORDER BY sort_date, seq`;
+
+async function fillGeomapTrack(body, panel, v, ctl, targets) {
+  try {
+    try {
+      const preview = await queryPanelSql(PREVIEW_TRACK_SQL, v, panel, ctl, { max_buckets: 400 });
+      if (preview && preview.ok !== false) {
+        drawGeomap(body, panel, preview.columns, preview.rows, { preview: true });
+      }
+    } catch (e) {
+      if (isAbort(e) || stale(ctl)) return;
+    }
+    const results = [];
+    for (const t of targets) {
+      try {
+        results.push(await queryPanelSql(t.rawSql, v, panel, ctl, { max_buckets: 8000 }));
+      } catch (e) {
+        if (isAbort(e) || stale(ctl)) return;
+        results.push({ ok: false, error: e.message || String(e) });
+      }
+    }
+    if (stale(ctl)) return;
+    const ok = results.filter((r) => r && r.ok !== false && !r.cancelled);
+    if (!ok.length) {
+      if (!body._tmMap) {
+        body.innerHTML = `<div class="err">${escapeHtml(results[0]?.error || "query failed")}</div>`;
+      }
+      return;
+    }
+    draw(body, panel, results);
+  } catch (e) {
+    if (isAbort(e) || stale(ctl)) return;
+    if (!body._tmMap) body.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function fillPanel(body, panel, v, ctl = {}) {
   if (panel.type === "row" || panel.type === "text" || panel.type === "dashlist") {
     body.textContent = panel.options?.content || "";
     return;
@@ -155,6 +278,11 @@ async function fillPanel(body, panel, v) {
     body.innerHTML = "";
     return;
   }
+  const layerType = (panel.options?.layers || []).map((l) => l.type).find(Boolean) || "route";
+  if (panel.type === "geomap" && layerType !== "markers") {
+    await fillGeomapTrack(body, panel, v, ctl, targets);
+    return;
+  }
   try {
     const results = [];
     for (const t of targets) {
@@ -165,24 +293,29 @@ async function fillPanel(body, panel, v) {
         if (params.get("charging_process_id")) q.charging_process_id = Number(params.get("charging_process_id"));
       }
       try {
-        results.push(
-          await api("/api/query", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(q),
-          })
-        );
+        const data = await api("/api/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(q),
+          signal: ctl.signal,
+        });
+        if (ctl.gen != null && ctl.gen !== dashGen) return;
+        if (data && data.cancelled) return;
+        results.push(data);
       } catch (e) {
+        if (isAbort(e) || (ctl.gen != null && ctl.gen !== dashGen)) return;
         results.push({ ok: false, error: e.message || String(e) });
       }
     }
-    const ok = results.filter((r) => r && r.ok !== false);
+    if (ctl.gen != null && ctl.gen !== dashGen) return;
+    const ok = results.filter((r) => r && r.ok !== false && !r.cancelled);
     if (!ok.length) {
       body.innerHTML = `<div class="err">${escapeHtml(results[0]?.error || "query failed")}</div>`;
       return;
     }
     draw(body, panel, results);
   } catch (e) {
+    if (isAbort(e) || (ctl.gen != null && ctl.gen !== dashGen)) return;
     body.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
   }
 }
@@ -1291,17 +1424,35 @@ function drawBarChart(el, panel, cols, rows) {
       .join("")}</div>`;
 }
 
-function drawGeomap(el, panel, cols, rows) {
+function ensureRouteMap(el) {
+  if (el._tmMap) return el._tmMap;
+  el.innerHTML = "";
   const map = L.map(el).setView([54, -2], 6);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "&copy; OSM",
     maxZoom: 19,
   }).addTo(map);
-  const latKey = cols.find((c) => /lat/i.test(c));
-  const lonKey = cols.find((c) => /lon|lng/i.test(c));
+  const g = { map, line: null, fitted: false };
+  el._tmMap = g;
+  return g;
+}
+
+function drawGeomap(el, panel, cols, rows, opts = {}) {
+  const preview = !!opts.preview;
   const layerType = (panel.options?.layers || []).map((l) => l.type).find(Boolean) || "route";
-  const pts = [];
   if (layerType === "markers") {
+    if (el._tmMap) {
+      el._tmMap.map.remove();
+      el._tmMap = null;
+    }
+    const map = L.map(el).setView([54, -2], 6);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OSM",
+      maxZoom: 19,
+    }).addTo(map);
+    const latKey = cols.find((c) => /lat/i.test(c));
+    const lonKey = cols.find((c) => /lon|lng/i.test(c));
+    const pts = [];
     const nameKey = cols.find((c) => /loc|name|address/i.test(c));
     const sizeKey = cols.find((c) => /chg_total|charges|energy/i.test(c));
     const sizes = rows.map((r) => Number(r[sizeKey])).filter((n) => Number.isFinite(n));
@@ -1317,15 +1468,39 @@ function drawGeomap(el, panel, cols, rows) {
       const label = [r[nameKey], Number.isFinite(n) ? formatNum(n) : null].filter(Boolean).join(" · ");
       if (label) m.bindTooltip(label);
     }
-  } else {
-    for (const r of rows) {
-      const la = Number(r[latKey]);
-      const lo = Number(r[lonKey]);
-      if (Number.isFinite(la) && Number.isFinite(lo)) pts.push([la, lo]);
-    }
-    if (pts.length) L.polyline(pts, { color: "#e85d04", weight: 3 }).addTo(map);
+    if (pts.length) map.fitBounds(pts, { padding: [16, 16] });
+    return;
   }
-  if (pts.length) map.fitBounds(pts, { padding: [16, 16] });
+  rows = downsampleRows(rows, preview ? 1500 : 8000);
+  const latKey = cols.find((c) => /lat/i.test(c));
+  const lonKey = cols.find((c) => /lon|lng/i.test(c));
+  const pts = [];
+  for (const r of rows) {
+    const la = Number(r[latKey]);
+    const lo = Number(r[lonKey]);
+    if (Number.isFinite(la) && Number.isFinite(lo)) pts.push([la, lo]);
+  }
+  const g = ensureRouteMap(el);
+  if (g.line) {
+    g.line.setLatLngs(pts);
+    g.line.setStyle({
+      weight: preview ? 2 : 3,
+      opacity: preview ? 0.55 : 1,
+      dashArray: preview ? "6 8" : null,
+    });
+  } else if (pts.length) {
+    g.line = L.polyline(pts, {
+      color: "#e85d04",
+      weight: preview ? 2 : 3,
+      opacity: preview ? 0.55 : 1,
+      dashArray: preview ? "6 8" : null,
+    }).addTo(g.map);
+  }
+  if (pts.length && (preview || !g.fitted)) {
+    g.map.fitBounds(pts, { padding: [16, 16] });
+    g.fitted = true;
+  }
+  requestAnimationFrame(() => g.map.invalidateSize());
 }
 
 function drawHeatmap(el, panel, cols, rows) {
@@ -1397,7 +1572,7 @@ function drawChart(el, panel, cols, rows, results) {
         ys.push(c);
       }
     }
-    for (const r of f.rows || []) {
+    for (const r of downsampleRows(f.rows || [], 2500)) {
       const x = toEpoch(r[tcol]) ?? num(r[tcol]);
       if (x == null) continue;
       const rec = points.get(x) || {};

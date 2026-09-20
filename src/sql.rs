@@ -20,6 +20,7 @@ pub struct QueryVars {
     #[serde(default = "default_speed")]
     pub speed_unit: String,
     #[serde(default = "default_interval")]
+    #[allow(dead_code)]
     pub interval: String,
     #[serde(default)]
     pub charging_process_id: Option<i64>,
@@ -32,6 +33,9 @@ pub struct QueryVars {
     pub period: String,
     #[serde(default)]
     pub extras: HashMap<String, String>,
+    /// Target points for `$__timeGroup`. Preview maps send ~400; hires tracks ~8000.
+    #[serde(default = "default_max_buckets")]
+    pub max_buckets: i64,
 }
 
 fn default_length() -> String {
@@ -58,6 +62,9 @@ fn default_charge_type() -> String {
 fn default_period() -> String {
     "month".into()
 }
+fn default_max_buckets() -> i64 {
+    1600
+}
 
 impl QueryVars {
     pub fn from_ts(&self) -> String {
@@ -66,6 +73,7 @@ impl QueryVars {
     pub fn to_ts(&self) -> String {
         fmt_ms(self.to_ms)
     }
+    #[allow(dead_code)]
     pub fn interval_secs(&self) -> i64 {
         parse_interval(&self.interval)
     }
@@ -163,7 +171,6 @@ fn expand_vars(sql: &str, vars: &QueryVars) -> String {
     let to = vars.to_ts();
     let from_q = format!("'{from}'");
     let to_q = format!("'{to}'");
-    let step = vars.interval_secs().max(1);
 
     let mut s = sql.to_string();
     s = s.replace("${preferred_range}", &vars.preferred_range);
@@ -186,8 +193,6 @@ fn expand_vars(sql: &str, vars: &QueryVars) -> String {
     s = s.replace("$period", &vars.period);
     s = s.replace("$car_id", &vars.car_id.to_string());
     s = s.replace("$__timezone", "UTC");
-    s = s.replace("$__interval", &vars.interval);
-    s = s.replace("$interval", &vars.interval);
     for (k, v) in &vars.extras {
         s = s.replace(&format!("${k}"), v);
         s = s.replace(&format!("${{{k}}}"), v);
@@ -226,34 +231,111 @@ fn expand_vars(sql: &str, vars: &QueryVars) -> String {
     s = s.replace("$__from", &vars.from_ms.to_string());
     s = s.replace("$__to", &vars.to_ms.to_string());
 
+    let max_buckets = vars.max_buckets;
+    let auto_secs = auto_bucket_with_cap(vars.to_ms.saturating_sub(vars.from_ms), 5, max_buckets);
+    let interval_lbl = interval_label(auto_secs);
+    s = s.replace("$__interval", &interval_lbl);
+    s = s.replace("$interval", &interval_lbl);
+
     s = replace_timefilter(&s, &from, &to);
     s = s.replace("$__timeFrom()", &from_q);
     s = s.replace("$__timeTo()", &to_q);
     s = s.replace("$__timeGroupAlias", "$__timeGroup");
 
+    let range_ms = vars.to_ms.saturating_sub(vars.from_ms);
     let timegroup = regex().timegroup.replace_all(&s, |caps: &regex::Captures| {
         let col = caps.get(1).unwrap().as_str();
         let iv = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let secs = if iv.starts_with('$') || iv.is_empty() {
-            step
+        let requested = if iv.starts_with('$') || iv.is_empty() {
+            auto_secs
         } else {
             parse_interval(iv.trim_matches('\'').trim_matches('"'))
         };
-        format!("(CAST(strftime('%s', {col}) AS INTEGER) / {secs}) * {secs}")
+        let secs = auto_bucket_with_cap(range_ms, requested, max_buckets);
+        format!("(unixepoch({col}) / {secs}) * {secs}")
     });
     s = timegroup.into_owned();
 
     s = regex()
         .time_as
         .replace_all(&s, |caps: &regex::Captures| {
-            format!(
-                "CAST(strftime('%s', {}) AS INTEGER) AS time",
-                caps.get(1).unwrap().as_str()
-            )
+            format!("unixepoch({}) AS time", caps.get(1).unwrap().as_str())
         })
         .into_owned();
 
+    s = rewrite_positions_hourly(&s, auto_secs, range_ms);
     s
+}
+
+/// Long-range charts (Projected Range, mileage, …) scan millions of GPS rows
+/// even after coarsening `$__timeGroup`. Point them at the hourly rollup instead.
+/// Route maps and climate/TPMS panels keep raw `positions`.
+fn rewrite_positions_hourly(sql: &str, bucket_secs: i64, range_ms: i64) -> String {
+    if bucket_secs < 1800 && range_ms < 2 * 86_400_000 {
+        return sql.to_string();
+    }
+    let lower = sql.to_ascii_lowercase();
+    if HOURLY_UNSAFE.iter().any(|col| lower.contains(col)) {
+        return sql.to_string();
+    }
+    Regex::new(r"(?i)\bFROM\s+positions\b")
+        .unwrap()
+        .replace_all(sql, "FROM position_hourly")
+        .into_owned()
+}
+
+/// `positions` columns that are not stored on `position_hourly`.
+const HOURLY_UNSAFE: &[&str] = &[
+    "latitude",
+    "longitude",
+    "speed",
+    "power",
+    "elevation",
+    "fan_status",
+    "driver_temp_setting",
+    "passenger_temp_setting",
+    "is_climate_on",
+    "is_rear_defroster_on",
+    "is_front_defroster_on",
+    "drive_id",
+    "inside_temp",
+    "battery_heater",
+    "est_battery_range_km",
+    "tpms_pressure",
+];
+
+/// Bucket width so a time-series has about `max_buckets` points. Hardcoded Grafana
+/// `5s` groups stay at 5s for a short trip and coarsen for 30d/1y windows.
+#[allow(dead_code)]
+pub fn auto_bucket_secs(range_ms: i64, requested: i64) -> i64 {
+    auto_bucket_with_cap(range_ms, requested, 1600)
+}
+
+fn auto_bucket_with_cap(range_ms: i64, requested: i64, max_buckets: i64) -> i64 {
+    const STEPS: [i64; 18] = [
+        5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400,
+        259200, 604800,
+    ];
+    let max_buckets = max_buckets.clamp(64, 20_000);
+    let range_secs = (range_ms / 1000).max(1);
+    let min_step = (range_secs / max_buckets).max(requested.max(1));
+    STEPS
+        .iter()
+        .copied()
+        .find(|&s| s >= min_step)
+        .unwrap_or(min_step)
+}
+
+fn interval_label(secs: i64) -> String {
+    if secs % 86400 == 0 {
+        format!("{}d", secs / 86400)
+    } else if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn replace_timefilter(sql: &str, from: &str, to: &str) -> String {
@@ -787,7 +869,7 @@ fn extract_to_sqlite(field: &str, expr: &str) -> String {
         if let Some((a, b)) = split_top_minus(e) {
             return interval_part(&f, &a, &b);
         }
-        return format!("CAST(strftime('%s', {e}) AS REAL)");
+        return format!("unixepoch({e})");
     }
     if let Some((a, b)) = split_top_minus(strip_outer_parens(e)) {
         return interval_part(&f, &a, &b);
@@ -817,7 +899,7 @@ fn strip_outer_parens(expr: &str) -> &str {
 
 fn interval_part(field: &str, a: &str, b: &str) -> String {
     let diff = format!(
-        "(CAST(strftime('%s', ({a})) AS REAL) - CAST(strftime('%s', ({b})) AS REAL))"
+        "(unixepoch({a}) - unixepoch({b}))"
     );
     match field {
         "epoch" | "second" | "seconds" => diff,
@@ -1036,14 +1118,139 @@ fn rewrite_greatest(sql: &str) -> String {
     s
 }
 
+const SQLITE_USER_TABLES: &[&str] = &[
+    "addresses",
+    "car_settings",
+    "cars",
+    "charges",
+    "charging_invoices",
+    "charging_processes",
+    "drives",
+    "geofences",
+    "invites",
+    "oauth_tokens",
+    "position_hourly",
+    "positions",
+    "sessions",
+    "settings",
+    "states",
+    "updates",
+    "users",
+    "webauthn_challenges",
+    "webauthn_credentials",
+];
+
+fn sqlite_row_counts_sql() -> String {
+    let unions = SQLITE_USER_TABLES
+        .iter()
+        .map(|t| {
+            format!("SELECT '{t}' AS \"Table Name\", (SELECT COUNT(*) FROM {t}) AS \"Row Count\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    format!("{unions} ORDER BY 2 DESC")
+}
+
+fn sqlite_table_sizes_sql() -> &'static str {
+    r#"SELECT
+  m.name AS "Table",
+  COALESCE(data.sz, 0) AS "Data",
+  COALESCE(idx.sz, 0) AS "Indexes",
+  COALESCE(data.sz, 0) + COALESCE(idx.sz, 0) AS "Total"
+FROM sqlite_master m
+LEFT JOIN (
+  SELECT name, SUM(pgsize) AS sz FROM dbstat GROUP BY name
+) data ON data.name = m.name
+LEFT JOIN (
+  SELECT i.tbl_name AS tbl, SUM(d.pgsize) AS sz
+  FROM sqlite_master i
+  JOIN dbstat d ON d.name = i.name
+  WHERE i.type = 'index'
+  GROUP BY i.tbl_name
+) idx ON idx.tbl = m.name
+WHERE m.type = 'table'
+  AND m.name NOT LIKE 'sqlite_%'
+ORDER BY 4 DESC"#
+}
+
+fn sqlite_indexes_sql() -> &'static str {
+    r#"SELECT
+  i.tbl_name AS "Table",
+  i.name AS "Index",
+  0 AS "Index Scans",
+  0 AS "Tuples Read",
+  0 AS "Tuples Fetched",
+  COALESCE((SELECT SUM(pgsize) FROM dbstat d WHERE d.name = i.name), 0) AS "Index Size"
+FROM sqlite_master i
+WHERE i.type = 'index'
+ORDER BY 6 DESC"#
+}
+
+fn sqlite_db_size_sql() -> &'static str {
+    r#"SELECT (SELECT page_count FROM pragma_page_count) * (SELECT page_size FROM pragma_page_size) AS "Size""#
+}
+
+fn sqlite_cache_size_sql() -> &'static str {
+    r#"SELECT CASE
+  WHEN cs.cache_size < 0 THEN -cs.cache_size * 1024
+  ELSE cs.cache_size * ps.page_size
+END
+FROM pragma_cache_size AS cs
+CROSS JOIN pragma_page_size AS ps"#
+}
+
+fn sqlite_query_stats_placeholder(order: &str) -> String {
+    format!(
+        r#"SELECT 0 AS "Calls", 0.0 AS "Mean Exec Time", 0.0 AS "Total Exec Time", 'n/a' AS "Query" WHERE 0 /* {order} */"#
+    )
+}
+
 fn rewrite_pg_catalog(sql: &str) -> String {
     let l = sql.to_ascii_lowercase();
-    if l.contains("pg_") || l.contains("pg_stat") || l.contains("pg_database") {
-        return "SELECT 'sqlite' AS engine, 'see Database Information (SQLite)' AS note WHERE 0"
-            .into();
+    if l.contains("${pg_stat_statements_info_last_reset") {
+        return "SELECT NULL AS stats_reset".into();
+    }
+    if l.contains("${pg_stat_statements_count") {
+        return "SELECT 0 AS count".into();
+    }
+    if l.contains("${pg_stat_statements_top_20_total") {
+        return sqlite_query_stats_placeholder("total");
+    }
+    if l.contains("${pg_stat_statements_top_20_mean") || l.contains("${pg_stat_statements_top_20")
+    {
+        return sqlite_query_stats_placeholder("mean");
+    }
+    if l.contains("query_to_xml") || (l.contains("xpath(") && l.contains("information_schema")) {
+        return sqlite_row_counts_sql();
+    }
+    if l.contains("sum(pg_total_relation_size") {
+        return sqlite_db_size_sql().into();
+    }
+    if l.contains("pg_statio_user_tables") {
+        return sqlite_table_sizes_sql().into();
+    }
+    if l.contains("pg_stat_all_indexes") {
+        return sqlite_indexes_sql().into();
+    }
+    if l.contains("shared_buffers") {
+        return sqlite_cache_size_sql().into();
+    }
+    if l.contains("information_schema") && l.contains("pg_stat_statements") {
+        return "SELECT 0 AS table_existence".into();
+    }
+    if l.contains("pg_stat_statements") {
+        return sqlite_query_stats_placeholder("mean");
     }
     if l.trim_start().starts_with("show ") {
         return "SELECT 'UTC' AS timezone".into();
+    }
+    if l.contains("regexp_replace(version()")
+        || (l.contains("version()") && l.contains("postgresql"))
+    {
+        return "SELECT sqlite_version() AS version".into();
+    }
+    if l.contains("pg_") || l.contains("pg_stat") || l.contains("pg_database") {
+        return "SELECT 'sqlite' AS engine, sqlite_version() AS version WHERE 0".into();
     }
     sql.to_string()
 }
@@ -1133,6 +1340,7 @@ mod tests {
             charge_type: "%".into(),
             period: "month".into(),
             extras: HashMap::new(),
+            max_buckets: 1600,
         };
         let out = translate("SELECT 1 FROM drives WHERE $__timeFilter(start_date) AND car_id = $car_id", &v);
         assert!(out.contains("BETWEEN"));
@@ -1155,6 +1363,7 @@ mod tests {
             charge_type: "%".into(),
             period: "month".into(),
             extras: HashMap::new(),
+            max_buckets: 1600,
         }
     }
 
@@ -1285,6 +1494,55 @@ mod tests {
     }
 
     #[test]
+    fn database_info_sqlite_catalog() {
+        let v = vars();
+        let sizes = translate(
+            r#"SELECT relname AS "Table", pg_relation_size(relid) as "Data" FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC"#,
+            &v,
+        );
+        assert!(sizes.contains("dbstat"), "{sizes}");
+        assert!(sizes.contains("sqlite_master"), "{sizes}");
+
+        let total = translate(
+            r#"SELECT SUM(pg_total_relation_size(relid)) As "Size" FROM pg_catalog.pg_statio_user_tables"#,
+            &v,
+        );
+        assert!(total.contains("pragma_page_count"), "{total}");
+
+        let rows = translate(
+            r#"SELECT table_name AS "Table Name", (xpath('/row/cnt/text()', xml_count))[1]::text::int AS "Row Count" FROM (SELECT table_name, query_to_xml(format('SELECT count(*) as cnt FROM %I.%I', table_schema, table_name), false, true, '') AS xml_count FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema')) AS t"#,
+            &v,
+        );
+        assert!(rows.to_ascii_lowercase().contains("from positions"), "{rows}");
+        assert!(rows.contains("Row Count"), "{rows}");
+
+        let idx = translate(
+            r#"SELECT relname AS "Table", indexrelname AS "Index", idx_scan AS "Index Scans", PG_RELATION_SIZE(indexrelid) as "Index Size" FROM pg_stat_all_indexes WHERE schemaname NOT LIKE 'pg_%'"#,
+            &v,
+        );
+        assert!(idx.contains("Index Size"), "{idx}");
+        assert!(idx.contains("dbstat"), "{idx}");
+
+        let cache = translate(
+            "SELECT cast(setting as numeric) * 8 * 1024 FROM pg_catalog.pg_settings WHERE name = 'shared_buffers'",
+            &v,
+        );
+        assert!(cache.contains("pragma_cache_size"), "{cache}");
+
+        let ver = translate(
+            "SELECT regexp_replace(version(), 'PostgreSQL ([^ ]+) .*', '\\1') AS version",
+            &v,
+        );
+        assert!(ver.contains("sqlite_version()"), "{ver}");
+
+        let tz = translate("show timezone;", &v);
+        assert!(tz.contains("UTC"), "{tz}");
+
+        let count = translate("${pg_stat_statements_count:raw}", &v);
+        assert!(count.to_ascii_lowercase().contains("select 0"), "{count}");
+    }
+
+    #[test]
     fn dashboards_prepare() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../schema.sql")).unwrap();
@@ -1300,6 +1558,17 @@ mod tests {
             .collect();
         if !core_errs.is_empty() {
             panic!("core dashboard SQL errors:\n{}", core_errs.join("\n"));
+        }
+        let dbinfo_errs: Vec<_> = errors
+            .iter()
+            .filter(|e| e.starts_with("database-info.json"))
+            .cloned()
+            .collect();
+        if !dbinfo_errs.is_empty() {
+            panic!(
+                "database-info SQL errors:\n{}",
+                dbinfo_errs.join("\n")
+            );
         }
         if !errors.is_empty() {
             eprintln!(
@@ -1327,6 +1596,54 @@ mod tests {
         }
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         collect_sql(&v, path, conn, vars, errors);
+    }
+
+    #[test]
+    fn timegroup_coarsens_long_range() {
+        let mut v = vars();
+        v.from_ms = 1_750_000_000_000;
+        v.to_ms = v.from_ms + 30 * 86_400_000;
+        let out = translate("SELECT $__timeGroup(date, '5s') AS time FROM positions", &v);
+        assert!(out.contains("unixepoch(date)"), "{out}");
+        assert!(!out.contains("/ 5)") && !out.contains("/ 5 "), "{out}");
+        let secs = auto_bucket_secs(v.to_ms - v.from_ms, 5);
+        assert!(secs >= 1800, "30d bucket {secs}");
+        assert!(out.contains(&format!("/ {secs})")), "{out}");
+    }
+
+    #[test]
+    fn timegroup_keeps_5s_for_a_short_trip() {
+        let mut v = vars();
+        v.from_ms = 1_750_000_000_000;
+        v.to_ms = v.from_ms + 2 * 3_600_000;
+        let out = translate("SELECT $__timeGroup(date, '5s') AS time FROM positions", &v);
+        assert!(out.contains("/ 5)"), "{out}");
+    }
+
+    #[test]
+    fn projected_range_uses_hourly_rollup() {
+        let sql = "SELECT $__timeGroup(date, $interval) AS time, avg(battery_level) FROM positions WHERE car_id = $car_id AND $__timeFilter(date) AND ideal_battery_range_km is not null GROUP BY 1";
+        let out = translate(sql, &vars());
+        assert!(out.to_ascii_lowercase().contains("from position_hourly"), "{out}");
+        let map = "SELECT latitude, longitude FROM positions p JOIN drives d ON p.drive_id = d.id WHERE $__timeFilter(d.start_date)";
+        let map_out = translate(map, &vars());
+        assert!(
+            map_out.to_ascii_lowercase().contains("from positions"),
+            "{map_out}"
+        );
+        assert!(
+            !map_out.to_ascii_lowercase().contains("position_hourly"),
+            "{map_out}"
+        );
+    }
+
+    #[test]
+    fn hires_buckets_are_finer_than_preview() {
+        let range = 30 * 86_400_000;
+        let preview = super::auto_bucket_with_cap(range, 5, 400);
+        let hires = super::auto_bucket_with_cap(range, 5, 8000);
+        assert!(hires < preview, "preview={preview} hires={hires}");
+        assert!(hires <= 900, "hires {hires}");
     }
 
     fn collect_sql(

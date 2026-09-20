@@ -236,7 +236,20 @@ fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
             tesla::f64_field(data, &["vehicle_state", "tpms_pressure_rr"]),
         ],
     )?;
+    let _ = crate::db::refresh_position_hour(&conn, car_id, &now);
     Ok(conn.last_insert_rowid())
+}
+
+/// One online poll: GPS snapshot plus drive/charge tick if that is what the car is doing.
+pub fn ingest_online(db: &Db, car_id: i64, data: &Value) -> Result<()> {
+    if is_charging(data) {
+        persist_charge_tick(db, car_id, data)
+    } else if is_driving(data) {
+        persist_drive_tick(db, car_id, data)
+    } else {
+        persist_snapshot(db, car_id, data)?;
+        Ok(())
+    }
 }
 
 fn persist_drive_tick(db: &Db, car_id: i64, data: &Value) -> Result<()> {

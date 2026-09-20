@@ -125,6 +125,11 @@ pub async fn serve(bind: SocketAddr) -> Result<()> {
         .route("/api/1/vehicles", get(products))
         .route("/api/1/vehicles/{id}", get(vehicle))
         .route("/api/1/vehicles/{id}/vehicle_data", get(vehicle_data))
+        .route("/api/1/vehicles/{id}/nearby_charging_sites", get(nearby))
+        .route("/api/1/vehicles/{id}/mobile_enabled", get(mobile_enabled))
+        .route("/api/1/users/me", get(users_me))
+        .route("/graphql", post(charging_history))
+        .route("/mobile-app/charging/history", get(charging_history_get))
         .with_state(App {
             car: Arc::new(Mutex::new(MockCar::default())),
         });
@@ -173,4 +178,58 @@ async fn vehicle_data(State(app): State<App>) -> Json<Value> {
     let mut car = app.car.lock().await;
     car.tick();
     Json(json!({ "response": car.snapshot() }))
+}
+
+fn mock_invoice() -> Value {
+    json!({
+        "chargeSessionId": "mock-sc-1",
+        "sessionId": 1,
+        "vin": crate::seed::MOCK_VIN,
+        "siteLocationName": "Heathrow, UK",
+        "chargeStartDateTime": "2026-06-01T08:00:00Z",
+        "chargeStopDateTime": "2026-06-01T08:28:00Z",
+        "fees": [{
+            "feeType": "CHARGING",
+            "pricingType": "PAYMENT",
+            "currencyCode": "GBP",
+            "usageBase": 26.6,
+            "rateBase": 0.40,
+            "uom": "kwh",
+            "totalDue": 10.64,
+            "netDue": 10.64
+        }]
+    })
+}
+
+async fn charging_history() -> Json<Value> {
+    Json(json!({
+        "data": {"me": {"charging": {"historyV2": {
+            "hasMoreData": false,
+            "pageNumber": 1,
+            "data": [mock_invoice()]
+        }}}}
+    }))
+}
+
+async fn charging_history_get() -> Json<Value> {
+    Json(json!({ "data": [mock_invoice()] }))
+}
+
+async fn nearby() -> Json<Value> {
+    Json(json!({
+        "response": {
+            "superchargers": [{"name": "Heathrow", "type": "supercharger"}],
+            "destination_charging": []
+        }
+    }))
+}
+
+async fn users_me() -> Json<Value> {
+    Json(json!({
+        "response": { "email": "mock@example.com", "full_name": "Mock User" }
+    }))
+}
+
+async fn mobile_enabled() -> Json<Value> {
+    Json(json!({ "response": true }))
 }

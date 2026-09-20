@@ -1,13 +1,45 @@
 use anyhow::{Context, Result};
 use chrono::Datelike;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use regex::Regex;
 use rusqlite::types::ValueRef;
 use rusqlite::{functions::FunctionFlags, Connection};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub type Db = Arc<Mutex<Connection>>;
+const READ_POOL: usize = 4;
+
+#[derive(Clone)]
+pub struct Db {
+    write: Arc<Mutex<Connection>>,
+    reads: Arc<Vec<Mutex<Connection>>>,
+    cursor: Arc<AtomicUsize>,
+}
+
+impl Db {
+    pub fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.write.lock()
+    }
+
+    /// WAL reader. Concurrent dashboard queries use different connections.
+    pub fn read(&self) -> MutexGuard<'_, Connection> {
+        if self.reads.is_empty() {
+            return self.write.lock();
+        }
+        let i = self.cursor.fetch_add(1, Ordering::Relaxed) % self.reads.len();
+        self.reads[i].lock()
+    }
+
+    #[allow(dead_code)]
+    pub fn from_write(conn: Connection) -> Self {
+        Self {
+            write: Arc::new(Mutex::new(conn)),
+            reads: Arc::new(Vec::new()),
+            cursor: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
 
 /// Settlement name for dashboards. Nominatim often stores a UK district in `city`
 /// (South Cambridgeshire, North Hertfordshire) while the town/village is in `raw`.
@@ -41,19 +73,106 @@ pub fn open(path: &Path) -> Result<Db> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    let write = open_conn(path, true).with_context(|| format!("open {}", path.display()))?;
+    if let Err(e) = ensure_position_hourly(&write) {
+        tracing::warn!("position_hourly backfill: {e:#}");
+    }
+    let mut reads = Vec::new();
+    let n = std::env::var("TESLAMATE_RS_READ_POOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(READ_POOL)
+        .clamp(0, 8);
+    if n > 0 {
+        for i in 0..n {
+            match open_conn(path, false) {
+                Ok(c) => {
+                    let _ = c.pragma_update(None, "query_only", true);
+                    reads.push(Mutex::new(c));
+                }
+                Err(e) => tracing::warn!("read pool slot {i}: {e:#}"),
+            }
+        }
+    }
+    Ok(Db {
+        write: Arc::new(Mutex::new(write)),
+        reads: Arc::new(reads),
+        cursor: Arc::new(AtomicUsize::new(0)),
+    })
+}
+
+fn open_conn(path: &Path, apply_schema: bool) -> Result<Connection> {
+    let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "busy_timeout", "5000")?;
+    conn.pragma_update(None, "busy_timeout", "15000")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "cache_size", "-131072")?; // 128 MB
     conn.pragma_update(None, "temp_store", "MEMORY")?;
-    conn.execute_batch(include_str!("../schema.sql"))?;
+    if apply_schema {
+        conn.execute_batch(include_str!("../schema.sql"))?;
+    }
     register_functions(&conn)?;
-    Ok(Arc::new(Mutex::new(conn)))
+    Ok(conn)
+}
+
+const HOURLY_INSERT: &str = "INSERT OR REPLACE INTO position_hourly (
+    car_id, date, n, battery_level, usable_battery_level,
+    rated_battery_range_km, ideal_battery_range_km, odometer, outside_temp)
+SELECT car_id,
+    datetime((unixepoch(date) / 3600) * 3600, 'unixepoch'),
+    count(*),
+    avg(battery_level),
+    avg(usable_battery_level),
+    avg(rated_battery_range_km),
+    avg(ideal_battery_range_km),
+    avg(odometer),
+    avg(outside_temp)
+FROM positions
+WHERE ideal_battery_range_km IS NOT NULL";
+
+fn ensure_position_hourly(conn: &Connection) -> Result<()> {
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM position_hourly", [], |r| r.get(0))
+        .unwrap_or(0);
+    if n == 0 {
+        conn.execute_batch(&format!("{HOURLY_INSERT} GROUP BY 1, 2"))?;
+        return Ok(());
+    }
+    let since: String = conn.query_row(
+        "SELECT COALESCE(max(date), '1970-01-01 00:00:00') FROM position_hourly",
+        [],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        &format!("{HOURLY_INSERT} AND date >= datetime(?1, '-1 hour') GROUP BY 1, 2"),
+        [since],
+    )?;
+    Ok(())
+}
+
+/// Rebuild the hour bucket that contains `ts` after a new GPS row.
+pub fn refresh_position_hour(conn: &Connection, car_id: i64, ts: &str) -> Result<()> {
+    conn.execute(
+        &format!(
+            "{HOURLY_INSERT}
+             AND car_id = ?1
+             AND date >= datetime((unixepoch(?2) / 3600) * 3600, 'unixepoch')
+             AND date < datetime((unixepoch(?2) / 3600) * 3600 + 3600, 'unixepoch')
+             GROUP BY 1, 2"
+        ),
+        rusqlite::params![car_id, ts],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
+    // Bundled sqlite is built with SQLITE_ENABLE_DBSTAT_VTAB (page sizes per btree).
+    let _ = conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.dbstat USING dbstat",
+        [],
+    );
+
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
 
     conn.create_scalar_function("convert_km", 2, flags, |ctx| {
@@ -176,7 +295,10 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
         Ok(osm_city(raw.as_deref(), city.as_deref(), county.as_deref()))
     })?;
 
-    conn.create_scalar_function("version", 0, flags, |_| Ok("SQLite".to_string()))?;
+    let sqlite_ver = rusqlite::version().to_string();
+    conn.create_scalar_function("version", 0, flags, move |_| {
+        Ok(format!("SQLite {sqlite_ver}"))
+    })?;
     conn.create_scalar_function("current_setting", 1, flags, |_| Ok("UTC".to_string()))?;
 
     conn.create_scalar_function("concat", -1, flags, |ctx| {

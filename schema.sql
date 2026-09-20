@@ -222,6 +222,34 @@ CREATE INDEX IF NOT EXISTS states_car_start ON states(car_id, start_date);
 CREATE INDEX IF NOT EXISTS updates_car_start ON updates(car_id, start_date);
 CREATE INDEX IF NOT EXISTS charges_date ON charges(date);
 
+CREATE TABLE IF NOT EXISTS charging_invoices (
+    session_id TEXT PRIMARY KEY,
+    vin TEXT NOT NULL,
+    site_name TEXT,
+    start_date TEXT NOT NULL,
+    end_date TEXT,
+    currency TEXT,
+    total_due REAL NOT NULL,
+    energy_kwh REAL,
+    rate_per_kwh REAL,
+    charging_process_id INTEGER UNIQUE REFERENCES charging_processes(id) ON DELETE SET NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS charging_invoices_vin_start ON charging_invoices(vin, start_date);
+
+CREATE TABLE IF NOT EXISTS position_hourly (
+    car_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    n INTEGER NOT NULL,
+    battery_level REAL,
+    usable_battery_level REAL,
+    rated_battery_range_km REAL,
+    ideal_battery_range_km REAL,
+    odometer REAL,
+    outside_temp REAL,
+    PRIMARY KEY (car_id, date)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS addresses_osm ON addresses(osm_id, osm_type) WHERE osm_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS users (

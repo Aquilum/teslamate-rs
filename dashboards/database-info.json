@@ -544,7 +544,7 @@
           "format": "table",
           "rawQuery": true,
           "rawSql": "SELECT regexp_replace(version(), 'PostgreSQL ([^ ]+) .*', '\\1') AS version;",
-          "refId": "PostgreSQL Version",
+          "refId": "SQLite version",
           "sql": {
             "columns": [
               {
@@ -564,7 +564,7 @@
           }
         }
       ],
-      "title": "PostgreSQL Version",
+      "title": "SQLite version",
       "type": "stat"
     },
     {
@@ -1012,7 +1012,7 @@
         "type": "grafana-postgresql-datasource",
         "uid": "TeslaMate"
       },
-      "description": "<b>Shared Buffers:</b> This metric shows the amount of memory PostgreSQL uses to store frequently accessed data, like tables and indexes, to make queries faster by avoiding slow disk reads.\n\n<b>Recommended value:</b> Use about 25% of your system's total RAM (e.g., 1GB for a system with 4GB RAM). Start with a modest value and adjust based on your app's needs. Setting it too high can waste memory.\n\n<b>To change in a Postgres Docker Compose file:</b> In your docker-compose.yml, add or update the command field under the Postgres service to include the shared_buffers setting. For example:\n\n<pre>\nservices:\n  database:\n    image: postgres:18-trixie\n    command: postgres -c shared_buffers=1GB\n    ...\n</pre>\n\nAfter updating the file, run <code>docker compose down</code> and <code>docker compose up -d</code> to restart the container and apply the change.\n\nFor more details: <a href='https://www.postgresql.org/docs/18/runtime-config-resource.html#GUC-SHARED-BUFFERS' target='_blank'>PostgreSQL: Documentation: 18: 19.4. Resource Consumption</a>",
+      "description": "<b>Page cache:</b> SQLite cache_size for this teslamate-rs process (how much memory is reserved for database pages). Default is 128&nbsp;MB (<code>PRAGMA cache_size = -131072</code>).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1067,7 +1067,7 @@
           "format": "table",
           "rawQuery": true,
           "rawSql": "SELECT cast(setting as numeric) * 8 * 1024 FROM pg_catalog.pg_settings WHERE name = 'shared_buffers';",
-          "refId": "Shared Buffers",
+          "refId": "Page cache",
           "sql": {
             "columns": [
               {
@@ -1087,7 +1087,7 @@
           }
         }
       ],
-      "title": "Shared Buffers",
+      "title": "Page cache",
       "type": "stat"
     },
     {
@@ -1181,7 +1181,7 @@
       },
       "id": 44,
       "panels": [],
-      "title": "Statistics of SQL planning and execution",
+      "title": "Dashboard query statistics",
       "type": "row"
     },
     {
@@ -1260,7 +1260,7 @@
           }
         }
       ],
-      "title": "Time at which all statistics in the pg_stat_statements view were last reset",
+      "title": "Query stats last reset",
       "type": "stat"
     },
     {
@@ -1339,7 +1339,7 @@
           }
         }
       ],
-      "title": "Number of Statements tracked via pg_stat_statements",
+      "title": "Tracked dashboard statements",
       "type": "stat"
     },
     {
@@ -1356,11 +1356,11 @@
           "showLineNumbers": false,
           "showMiniMap": false
         },
-        "content": "Check the [contribution docs](https://docs.teslamate.org/docs/development#enable-pg_stat_statements-to-collect-query-statistics) on how to enable tracking planning and execution statistics of all SQL statements executed by a server.\n",
+        "content": "teslamate-rs uses SQLite, which has no `pg_stat_statements`. The tables below list recent **dashboard** queries (call count and wall time), including 30s cache hits.\n",
         "mode": "markdown"
       },
       "pluginVersion": "13.1.1",
-      "title": "About pg_stat_statements (track statistics of SQL planning and execution)",
+      "title": "About query statistics",
       "type": "text"
     },
     {

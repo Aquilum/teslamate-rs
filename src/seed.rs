@@ -6,7 +6,8 @@ const VIN: &str = "5YJSA7E2XNF000001";
 pub fn seed(conn: &mut Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     conn.execute_batch(
-        "DELETE FROM charges;
+        "         DELETE FROM charging_invoices;
+         DELETE FROM charges;
          DELETE FROM charging_processes;
          DELETE FROM positions;
          DELETE FROM drives;
