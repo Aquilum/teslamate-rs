@@ -125,7 +125,37 @@ pub fn translate(sql: &str, vars: &QueryVars) -> String {
     s = rewrite_greatest(&s);
     s = rewrite_pg_catalog(&s);
     s = rewrite_misc(&s);
+    s = rewrite_count_star_alias(&s);
     s
+}
+
+/// Grafana's Postgres plugin names a bare `count(*)` column `count`.
+fn rewrite_count_star_alias(sql: &str) -> String {
+    let re = Regex::new(r"(?i)\bcount\s*\(\s*\*\s*\)").unwrap();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut last = 0;
+    for m in re.find_iter(sql) {
+        out.push_str(&sql[last..m.start()]);
+        out.push_str(&sql[m.start()..m.end()]);
+        let rest = sql[m.end()..].trim_start();
+        let next_word = rest
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("");
+        let select_item = rest.is_empty()
+            || rest.starts_with(',')
+            || next_word.eq_ignore_ascii_case("from");
+        if select_item
+            && !next_word.eq_ignore_ascii_case("as")
+            && !next_word.eq_ignore_ascii_case("filter")
+            && !next_word.eq_ignore_ascii_case("over")
+        {
+            out.push_str(" AS count");
+        }
+        last = m.end();
+    }
+    out.push_str(&sql[last..]);
+    out
 }
 
 fn expand_vars(sql: &str, vars: &QueryVars) -> String {
@@ -172,6 +202,7 @@ fn expand_vars(sql: &str, vars: &QueryVars) -> String {
     s = s.replace("$min_distance", "0.01");
     s = s.replace("$min_dist", "0.01");
     s = s.replace("$min_speed", "1");
+    s = s.replace("$efficiency", "by distance");
     s = s.replace("$high_precision", "0");
     s = s.replace("$exclude", "0");
     s = s.replace("$pg_stat_statements_enabled", "0");
@@ -391,7 +422,7 @@ fn rewrite_generate_series(sql: &str, vars: &QueryVars) -> String {
     let from = vars.from_ts();
     let to = vars.to_ts();
     let dummy = format!(
-        "(WITH RECURSIVE gs(date) AS (SELECT date('{from}') UNION ALL SELECT date(date, '+1 day') FROM gs WHERE date < date('{to}')) SELECT date FROM gs)"
+        "(WITH RECURSIVE gs(date) AS (SELECT datetime(date('{from}')) UNION ALL SELECT datetime(date, '+1 day') FROM gs WHERE date < datetime(date('{to}'))) SELECT date FROM gs)"
     );
     let mut s = sql.to_string();
     loop {
@@ -1203,6 +1234,36 @@ mod tests {
         );
         assert!(!out.to_ascii_lowercase().contains("extract"), "{out}");
         assert!(out.matches(')').count() >= out.matches('(').count(), "{out}");
+    }
+
+    #[test]
+    fn count_star_aliased_as_count() {
+        let out = translate(
+            "select count(*), count(distinct city) as city_count from addresses",
+            &vars(),
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("count(*) as count"), "{out}");
+        assert!(lower.contains("city_count"), "{out}");
+    }
+
+    #[test]
+    fn count_star_keeps_existing_alias() {
+        let out = translate("select count(*) as n from drives", &vars());
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("count(*) as n"), "{out}");
+        assert!(!lower.contains("as count"), "{out}");
+    }
+
+    #[test]
+    fn count_star_not_aliased_in_expression() {
+        let out = translate(
+            "select sum(x) / count(*) > 0.25 as reduced from positions",
+            &vars(),
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("/ count(*) >"), "{out}");
+        assert!(!lower.contains("as count >"), "{out}");
     }
 
     #[test]

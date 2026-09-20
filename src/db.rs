@@ -9,6 +9,34 @@ use std::sync::Arc;
 
 pub type Db = Arc<Mutex<Connection>>;
 
+/// Settlement name for dashboards. Nominatim often stores a UK district in `city`
+/// (South Cambridgeshire, North Hertfordshire) while the town/village is in `raw`.
+fn osm_city(raw: Option<&str>, city: Option<&str>, county: Option<&str>) -> Option<String> {
+    if let Some(raw) = raw {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(addr) = v.get("address") {
+                for key in ["town", "village", "hamlet"] {
+                    if let Some(s) = addr
+                        .get(key)
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let city = city.map(str::trim).filter(|s| !s.is_empty());
+    let county = county.map(str::trim).filter(|s| !s.is_empty());
+    match (city, county) {
+        (Some(c), Some(k)) if c.eq_ignore_ascii_case(k) => None,
+        (Some(c), _) => Some(c.to_string()),
+        _ => None,
+    }
+}
+
 pub fn open(path: &Path) -> Result<Db> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -139,6 +167,13 @@ pub(crate) fn register_functions(conn: &Connection) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(&delim)
         }))
+    })?;
+
+    conn.create_scalar_function("osm_city", 3, flags, |ctx| {
+        let raw: Option<String> = ctx.get(0)?;
+        let city: Option<String> = ctx.get(1)?;
+        let county: Option<String> = ctx.get(2)?;
+        Ok(osm_city(raw.as_deref(), city.as_deref(), county.as_deref()))
     })?;
 
     conn.create_scalar_function("version", 0, flags, |_| Ok("SQLite".to_string()))?;
@@ -430,4 +465,44 @@ pub fn default_db_path() -> std::path::PathBuf {
         }
     }
     default_home().join(DEFAULT_DB_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::osm_city;
+
+    #[test]
+    fn prefers_nominatim_town_over_district_city() {
+        let raw = r#"{"address":{"city":"North Hertfordshire","town":"Royston","county":"Hertfordshire"}}"#;
+        assert_eq!(
+            osm_city(Some(raw), Some("North Hertfordshire"), Some("Hertfordshire")).as_deref(),
+            Some("Royston")
+        );
+    }
+
+    #[test]
+    fn prefers_village_when_city_is_district() {
+        let raw = r#"{"address":{"city":"South Cambridgeshire","village":"Bar Hill","county":"Cambridgeshire"}}"#;
+        assert_eq!(
+            osm_city(Some(raw), Some("South Cambridgeshire"), Some("Cambridgeshire")).as_deref(),
+            Some("Bar Hill")
+        );
+    }
+
+    #[test]
+    fn keeps_real_city_when_no_town() {
+        let raw = r#"{"address":{"city":"Cambridge","county":"Cambridgeshire"}}"#;
+        assert_eq!(
+            osm_city(Some(raw), Some("Cambridge"), Some("Cambridgeshire")).as_deref(),
+            Some("Cambridge")
+        );
+    }
+
+    #[test]
+    fn drops_city_when_it_duplicates_county() {
+        assert_eq!(
+            osm_city(None, Some("Cambridgeshire"), Some("Cambridgeshire")),
+            None
+        );
+    }
 }

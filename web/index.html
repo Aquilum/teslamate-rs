@@ -9,31 +9,88 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <aside id="nav">
-    <div class="brand">teslamate-rs</div>
-    <div id="nav-list"></div>
-  </aside>
-  <main>
-    <header id="toolbar">
-      <h1 id="title">Overview</h1>
-      <div class="controls">
-        <label>Car <select id="car"></select></label>
-        <label>From <input type="datetime-local" id="from"></label>
-        <label>To <input type="datetime-local" id="to"></label>
-        <div class="presets">
-          <button data-range="1d">24h</button>
-          <button data-range="7d">7d</button>
-          <button data-range="30d">30d</button>
-          <button data-range="90d">90d</button>
-          <button data-range="1y">1y</button>
-          <button data-range="all">All</button>
-        </div>
+  <div id="gate" hidden>
+    <form class="auth-card" id="card-setup" hidden>
+      <h1>teslamate-rs</h1>
+      <p class="lead">Create the first admin account. Later users need an invite.</p>
+      <label for="setup-user">Username</label>
+      <input id="setup-user" autocomplete="username" required>
+      <label for="setup-pass">Password</label>
+      <input id="setup-pass" type="password" autocomplete="new-password" minlength="8">
+      <div class="auth-actions">
+        <button type="submit">Create admin</button>
+        <button type="button" id="setup-passkey" class="ghost">Use passkey</button>
       </div>
-    </header>
-    <div id="board"></div>
-  </main>
+      <div class="auth-error" id="setup-err"></div>
+    </form>
+    <form class="auth-card" id="card-login" hidden>
+      <h1>teslamate-rs</h1>
+      <p class="lead" id="login-lead">Sign in with your teslamate-rs account.</p>
+      <label for="login-user">Username</label>
+      <input id="login-user" autocomplete="username" required>
+      <label for="login-pass">Password</label>
+      <input id="login-pass" type="password" autocomplete="current-password">
+      <div class="auth-actions">
+        <button type="submit">Sign in</button>
+        <button type="button" id="login-passkey" class="ghost">Use passkey</button>
+      </div>
+      <div class="auth-error" id="login-err"></div>
+    </form>
+    <form class="auth-card" id="card-register" hidden>
+      <h1>teslamate-rs</h1>
+      <p class="lead">You’ve been invited. Choose a username and a password or passkey.</p>
+      <label for="reg-user">Username</label>
+      <input id="reg-user" autocomplete="username" required>
+      <label for="reg-pass">Password</label>
+      <input id="reg-pass" type="password" autocomplete="new-password" minlength="8">
+      <div class="auth-actions">
+        <button type="submit">Create account</button>
+        <button type="button" id="reg-passkey" class="ghost">Use passkey</button>
+      </div>
+      <div class="auth-error" id="reg-err"></div>
+    </form>
+  </div>
+  <div id="app" hidden>
+    <aside id="nav">
+      <div class="brand">teslamate-rs</div>
+      <div id="nav-list"></div>
+    </aside>
+    <main>
+      <header id="toolbar">
+        <h1 id="title">Overview</h1>
+        <div class="controls">
+          <label>Car <select id="car"></select></label>
+          <label>From <input type="datetime-local" id="from"></label>
+          <label>To <input type="datetime-local" id="to"></label>
+          <div class="presets">
+            <button data-range="1d">24h</button>
+            <button data-range="7d">7d</button>
+            <button data-range="30d">30d</button>
+            <button data-range="90d">90d</button>
+            <button data-range="1y">1y</button>
+            <button data-range="all">All</button>
+          </div>
+          <div class="account" id="account">
+            <button type="button" class="ghost who" id="account-btn">Account</button>
+            <div class="menu" id="account-menu">
+              <p id="account-name"></p>
+              <div id="passkey-list"></div>
+              <div class="auth-actions">
+                <button type="button" id="add-passkey" class="ghost">Add passkey</button>
+                <button type="button" id="invite-btn" class="ghost" hidden>Create invite</button>
+                <button type="button" id="logout-btn" class="ghost">Log out</button>
+              </div>
+              <p id="invite-url" class="auth-error"></p>
+            </div>
+          </div>
+        </div>
+      </header>
+      <div id="board"></div>
+    </main>
+  </div>
   <script src="/vendor/leaflet.js"></script>
   <script src="/vendor/uPlot.iife.min.js"></script>
+  <script src="/auth.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

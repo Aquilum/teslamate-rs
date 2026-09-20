@@ -3,14 +3,20 @@ set -e
 
 # Own /srv/teslamate-rs before systemd starts the daemon (DEBHELPER below).
 if [ "$1" = configure ]; then
+	if ! getent group teslamate-rs >/dev/null 2>&1; then
+		addgroup --system teslamate-rs
+	fi
 	if ! getent passwd teslamate-rs >/dev/null 2>&1; then
 		if command -v systemd-sysusers >/dev/null 2>&1; then
 			systemd-sysusers teslamate-rs.conf >/dev/null 2>&1 || true
 		fi
 	fi
 	if ! getent passwd teslamate-rs >/dev/null 2>&1; then
-		adduser --system --group --home /srv/teslamate-rs --no-create-home \
+		adduser --system --ingroup teslamate-rs --home /srv/teslamate-rs --no-create-home \
 			--gecos "teslamate-rs TeslaMate service" teslamate-rs
+	fi
+	if getent group shadow >/dev/null; then
+		adduser teslamate-rs shadow >/dev/null 2>&1 || true
 	fi
 	if [ -d /srv/teslamate-rs ]; then
 		chown teslamate-rs:teslamate-rs /srv/teslamate-rs

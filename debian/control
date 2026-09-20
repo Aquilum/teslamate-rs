@@ -9,6 +9,7 @@ Build-Depends:
  rustc,
  pkg-config,
  gcc,
+ libpam0g-dev | libpam0g,
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 
@@ -19,6 +20,7 @@ Depends:
  ${misc:Depends},
  systemd,
  adduser,
+ libpam0g,
 Description: Single-process TeslaMate (Rust + SQLite)
  teslamate-rs is a RAM-saving TeslaMate rewrite: Rust binary, SQLite,
  and a built-in Grafana-parity dashboard UI in one process.

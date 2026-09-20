@@ -1,8 +1,11 @@
+use crate::app_state::{App, AuthLimiter};
+use crate::auth::{AuthState, AuthUser, PasswordBackend};
 use crate::db::Db;
 use crate::sql::{self, QueryVars};
 use anyhow::Result;
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,11 +16,6 @@ use serde_json::{json, Value};
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 
-#[derive(Clone)]
-pub struct App {
-    pub db: Db,
-}
-
 #[derive(RustEmbed)]
 #[folder = "web/"]
 struct Web;
@@ -26,7 +24,43 @@ struct Web;
 #[folder = "dashboards/"]
 struct Dashboards;
 
-pub async fn serve(db: Db, bind: SocketAddr) -> Result<()> {
+pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) -> Result<()> {
+    let origin = if bind.ip().is_loopback() {
+        format!("http://localhost:{}", bind.port())
+    } else {
+        format!("http://{bind}")
+    };
+    let rp_id = origin
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or("localhost")
+        .to_string();
+    let auth = AuthState::new(&rp_id, &origin).map_err(|e| anyhow::anyhow!("{e}"))?;
+    match password_backend {
+        PasswordBackend::Pam => {
+            let service = crate::pam_auth::service_name();
+            let group = crate::pam_auth::required_group()
+                .map(|g| format!("group={g}"))
+                .unwrap_or_else(|| "group=(any PAM user)".into());
+            tracing::info!("password backend: PAM (service={service}, {group})");
+            if let Some(group) = crate::pam_auth::required_group() {
+                if !crate::pam_auth::group_exists(&group) {
+                    tracing::warn!(
+                        "group {group} does not exist yet; any PAM-authenticated user can sign in until you create it"
+                    );
+                }
+            }
+        }
+        PasswordBackend::Local => tracing::info!("password backend: local (SQLite argon2)"),
+    }
+    let state = App {
+        db,
+        auth,
+        password_backend,
+        limiter: AuthLimiter::default(),
+    };
     let app = Router::new()
         .route("/", get(index))
         .route("/api/health", get(health))
@@ -36,13 +70,34 @@ pub async fn serve(db: Db, bind: SocketAddr) -> Result<()> {
         .route("/api/dashboards/{*path}", get(get_dashboard))
         .route("/api/query", post(run_query))
         .route("/api/dbinfo", get(dbinfo))
+        .merge(crate::auth_http::router())
         .route("/{*path}", get(static_file))
-        .with_state(App { db })
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state)
         .layer(TraceLayer::new_for_http());
     tracing::info!("teslamate-rs listening on http://{bind}");
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
+        ),
+    );
+    res
 }
 
 async fn index() -> impl IntoResponse {
@@ -77,7 +132,7 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "name": "teslamate-rs" }))
 }
 
-async fn cars(State(app): State<App>) -> Result<Json<Value>, AppError> {
+async fn cars(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
     let conn = app.db.lock();
     let mut stmt = conn.prepare(
         "SELECT id, name, model, trim_badging, efficiency FROM cars ORDER BY display_priority, id",
@@ -96,7 +151,7 @@ async fn cars(State(app): State<App>) -> Result<Json<Value>, AppError> {
     Ok(Json(json!(rows)))
 }
 
-async fn settings(State(app): State<App>) -> Result<Json<Value>, AppError> {
+async fn settings(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
     let conn = app.db.lock();
     let v = conn
         .query_row(
@@ -148,19 +203,17 @@ struct DashMeta {
     folder: String,
 }
 
-async fn list_dashboards() -> Json<Vec<DashMeta>> {
+async fn list_dashboards(_user: AuthUser) -> Json<Vec<DashMeta>> {
     let mut out = Vec::new();
     for name in Dashboards::iter() {
-        if !name.ends_with(".json") {
+        if !name.ends_with(".json") || name.starts_with("internal/") {
             continue;
         }
         let Some(file) = Dashboards::get(name.as_ref()) else {
             continue;
         };
         let parsed: Value = serde_json::from_slice(&file.data).unwrap_or(Value::Null);
-        let folder = if name.starts_with("internal/") {
-            "Internal"
-        } else if name.starts_with("reports/") {
+        let folder = if name.starts_with("reports/") {
             "Reports"
         } else {
             "TeslaMate"
@@ -184,7 +237,7 @@ async fn list_dashboards() -> Json<Vec<DashMeta>> {
     Json(out)
 }
 
-async fn get_dashboard(Path(path): Path<String>) -> Response {
+async fn get_dashboard(_user: AuthUser, Path(path): Path<String>) -> Response {
     match Dashboards::get(&path) {
         Some(f) => (
             [(header::CONTENT_TYPE, "application/json")],
@@ -203,6 +256,7 @@ struct QueryBody {
 }
 
 async fn run_query(
+    _user: AuthUser,
     State(app): State<App>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, AppError> {
@@ -261,7 +315,7 @@ fn sqlite_to_json(v: ValueRef) -> Value {
     }
 }
 
-async fn dbinfo(State(app): State<App>) -> Result<Json<Value>, AppError> {
+async fn dbinfo(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
     let conn = app.db.lock();
     let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
     let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;

@@ -1,12 +1,17 @@
+mod app_state;
+mod auth;
+mod auth_http;
 mod db;
 mod import;
 mod logger;
 mod mock;
+mod pam_auth;
 mod seed;
 mod server;
 mod sql;
 mod tesla;
 mod tokens;
+mod users;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -57,6 +62,10 @@ enum Cmd {
         port: u16,
         #[arg(long, env = "TESLAMATE_RS_NO_LOGGER")]
         no_logger: bool,
+        /// Password backend: `local` (SQLite argon2) or `pam` (Linux). Default: PAM when
+        /// `/etc/pam.d/teslamate-rs` exists, otherwise local. Also `TESLAMATE_RS_AUTH`.
+        #[arg(long, env = "TESLAMATE_RS_AUTH")]
+        auth: Option<String>,
     },
     /// Store an Owner API refresh token and register vehicles
     Login {
@@ -160,13 +169,16 @@ async fn main() -> Result<()> {
             bind,
             port,
             no_logger,
+            auth,
         } => {
             if !no_logger {
                 let db2 = db.clone();
                 tokio::spawn(async move { logger::run(db2).await });
             }
             let addr: SocketAddr = format!("{bind}:{port}").parse()?;
-            server::serve(db, addr).await?;
+            let backend = auth::resolve_password_backend(auth.as_deref())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            server::serve(db, addr, backend).await?;
         }
         Cmd::Login { refresh_token } => {
             logger::login(&db, &refresh_token).await?;
@@ -199,7 +211,9 @@ async fn main() -> Result<()> {
             let db2 = db.clone();
             tokio::spawn(async move { logger::run(db2).await });
             let addr: SocketAddr = format!("{bind}:{port}").parse()?;
-            server::serve(db, addr).await?;
+            let backend = auth::resolve_password_backend(None)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            server::serve(db, addr, backend).await?;
         }
         Cmd::Doctor => {
             let conn = db.lock();

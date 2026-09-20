@@ -7,12 +7,14 @@ Wants=network-online.target
 Type=simple
 User=teslamate-rs
 Group=teslamate-rs
+SupplementaryGroups=shadow
 WorkingDirectory=/srv/teslamate-rs
 Environment=TESLAMATE_RS_HOME=/srv/teslamate-rs
 Environment=TESLAMATE_RS_BIND=127.0.0.1
 Environment=TESLAMATE_RS_PORT=4010
+Environment=TESLAMATE_RS_AUTH=pam
 EnvironmentFile=-/etc/default/teslamate-rs
-ExecStart=/usr/bin/teslamate-rs serve
+ExecStart=/usr/bin/teslamate-rs serve --bind 127.0.0.1 --port 4010 --auth pam
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

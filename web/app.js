@@ -26,6 +26,29 @@ function applyRange(key) {
   $("to").value = toLocalInput(to);
 }
 
+function parseGrafanaTimeFrom(rel, toMs) {
+  const m = String(rel || "").trim().match(/^(\d+)\s*([smhdwMy])$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const u = m[2];
+  if (u === "s") return toMs - n * 1000;
+  if (u === "m") return toMs - n * 60 * 1000;
+  if (u === "h") return toMs - n * 3600 * 1000;
+  if (u === "d") return toMs - n * 86400 * 1000;
+  if (u === "w") return toMs - n * 7 * 86400 * 1000;
+  const d = new Date(toMs);
+  if (u === "M") d.setMonth(d.getMonth() - n);
+  else if (u === "y") d.setFullYear(d.getFullYear() - n);
+  else return null;
+  return d.getTime();
+}
+
+function withPanelTime(v, panel) {
+  const from = parseGrafanaTimeFrom(panel?.timeFrom, v.to_ms);
+  if (from == null) return v;
+  return { ...v, from_ms: from };
+}
+
 function vars() {
   const from = new Date($("from").value);
   const to = new Date($("to").value);
@@ -45,7 +68,11 @@ function vars() {
 }
 
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  if (r.status === 401) {
+    await tmAuth.route(await tmAuth.status());
+    throw new Error("sign in required");
+  }
   if (!r.ok) throw new Error(`${path} ${r.status}`);
   return r.json();
 }
@@ -115,12 +142,14 @@ async function fillPanel(body, panel, v) {
     body.textContent = panel.options?.content || "";
     return;
   }
-  let targets = (panel.targets || []).filter((t) => t.rawSql);
-  if (!targets.length) {
-    const srcId = (panel.targets || []).find((t) => t.panelId != null)?.panelId;
-    const src = srcId != null && currentDash ? flattenPanels(currentDash.panels).find((p) => p.id === srcId) : null;
-    const sql = src?.targets?.find((t) => t.rawSql)?.rawSql;
-    if (sql) targets = [{ rawSql: sql }];
+  const targets = [];
+  for (const t of panel.targets || []) {
+    let sql = t.rawSql;
+    if (!sql && t.panelId != null && currentDash) {
+      const src = flattenPanels(currentDash.panels).find((p) => p.id === t.panelId);
+      sql = src?.targets?.find((x) => x.rawSql)?.rawSql;
+    }
+    if (sql) targets.push({ rawSql: sql });
   }
   if (!targets.length) {
     body.innerHTML = "";
@@ -129,17 +158,27 @@ async function fillPanel(body, panel, v) {
   try {
     const results = [];
     for (const t of targets) {
-      const q = { sql: t.rawSql, ...v };
+      const q = { sql: t.rawSql, ...withPanelTime(v, panel) };
       if (panel.type === "geomap" || /drive_id|charging_process_id/.test(t.rawSql)) {
         const params = new URLSearchParams(location.search);
         if (params.get("drive_id")) q.drive_id = Number(params.get("drive_id"));
         if (params.get("charging_process_id")) q.charging_process_id = Number(params.get("charging_process_id"));
       }
-      results.push(await api("/api/query", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(q) }));
+      try {
+        results.push(
+          await api("/api/query", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(q),
+          })
+        );
+      } catch (e) {
+        results.push({ ok: false, error: e.message || String(e) });
+      }
     }
-    const first = results[0];
-    if (!first.ok) {
-      body.innerHTML = `<div class="err">${escapeHtml(first.error || "query failed")}</div>`;
+    const ok = results.filter((r) => r && r.ok !== false);
+    if (!ok.length) {
+      body.innerHTML = `<div class="err">${escapeHtml(results[0]?.error || "query failed")}</div>`;
       return;
     }
     draw(body, panel, results);
@@ -151,7 +190,7 @@ async function fillPanel(body, panel, v) {
 function interpTitle(s, v, panel) {
   if (!s) return panel?.type === "row" ? "" : "";
   const car = cars.find((c) => Number(c.id) === Number(v.car_id));
-  return s
+  let title = s
     .replaceAll("${car_id}", car?.name || String(v.car_id))
     .replaceAll("${car_id}", car?.name || String(v.car_id))
     .replaceAll("$car_id", car?.name || String(v.car_id))
@@ -165,6 +204,8 @@ function interpTitle(s, v, panel) {
     .replaceAll("${preferred_range}", v.preferred_range || "rated")
     .replaceAll("$charge_type", "all")
     .replaceAll("${charge_type}", "all");
+  if (panel?.timeFrom) title = `${title} · ${panel.timeFrom}`;
+  return title;
 }
 
 function ciGet(obj, key) {
@@ -188,6 +229,7 @@ function hiddenCol(c, panel) {
   if (!panel) return false;
   const org = organizeOpts(panel);
   if (ciGet(org.excludeByName, n)) return true;
+  if (/^count\(\*\)$/i.test(n) && ciGet(org.excludeByName, "count")) return true;
   const props = fieldOverride(panel, n);
   return Boolean(props["custom.hideFrom.viz"]);
 }
@@ -445,7 +487,7 @@ function vampireRowClass(row, stats) {
 }
 
 function joinKey(cols) {
-  return ["date", "display", "date_from", "time"].find((k) => (cols || []).includes(k));
+  return ["date", "display", "date_from", "time", "metric"].find((k) => (cols || []).includes(k));
 }
 
 function mergeFrames(results) {
@@ -501,10 +543,10 @@ function fieldOperand(side, row) {
 function applyCalculateFields(panel, columns, rows) {
   const calcs = (panel.transformations || []).filter((t) => t.id === "calculateField");
   if (!calcs.length) return { columns, rows };
-  const cols = columns.slice();
-  const out = rows.map((r) => ({ ...r }));
+  let cols = columns.slice();
+  let out = rows.map((r) => ({ ...r }));
   for (const t of calcs) {
-    const alias = t.options?.alias;
+    const alias = interpTitle(t.options?.alias || "", vars(), panel);
     const bin = t.options?.binary;
     if (!alias || !bin) continue;
     if (!cols.includes(alias)) cols.push(alias);
@@ -521,8 +563,101 @@ function applyCalculateFields(panel, columns, rows) {
       }
       row[alias] = v;
     }
+    if (t.options?.replaceFields) {
+      cols = [alias];
+      out = out.map((r) => ({ [alias]: r[alias] }));
+    }
   }
   return { columns: cols, rows: out };
+}
+
+function applyFilterFields(panel, columns, rows) {
+  const t = (panel.transformations || []).find((x) => x.id === "filterFieldsByName");
+  if (!t) return { columns, rows };
+  const inc = t.options?.include || {};
+  const names = (inc.names || []).map((n) => String(n).toLowerCase());
+  let re = null;
+  if (inc.pattern) {
+    try {
+      re = new RegExp(inc.pattern);
+    } catch {
+      re = null;
+    }
+  }
+  if (!names.length && !re) return { columns, rows };
+  const cols = columns.filter((c) => {
+    const n = String(c);
+    if (names.includes(n.toLowerCase())) return true;
+    if (re && re.test(n)) return true;
+    return false;
+  });
+  if (!cols.length) return { columns, rows };
+  return { columns: cols, rows };
+}
+
+function applyJoinByField(panel, results) {
+  const t = (panel.transformations || []).find((x) => x.id === "joinByField");
+  const by = t?.options?.byField;
+  if (!by) return mergeFrames(results);
+  const frames = (results || []).filter((r) => r && r.ok !== false);
+  if (frames.length <= 1) return mergeFrames(results);
+  const maps = frames.map((f) => {
+    const col = (f.columns || []).find((c) => String(c).toLowerCase() === String(by).toLowerCase()) || by;
+    const m = new Map();
+    for (const row of f.rows || []) {
+      const key = String(row[col] ?? "");
+      m.set(key, { ...(m.get(key) || {}), ...row });
+    }
+    return m;
+  });
+  let keys = [...maps[0].keys()];
+  if (t.options?.mode === "inner") {
+    for (const m of maps.slice(1)) keys = keys.filter((k) => m.has(k));
+  } else {
+    const all = new Set(keys);
+    for (const m of maps.slice(1)) for (const k of m.keys()) all.add(k);
+    keys = [...all];
+  }
+  const columns = [];
+  const seen = new Set();
+  for (const f of frames) {
+    for (const c of f.columns || []) {
+      if (!seen.has(c)) {
+        seen.add(c);
+        columns.push(c);
+      }
+    }
+  }
+  const rows = keys.map((k) => {
+    const row = {};
+    for (const m of maps) Object.assign(row, m.get(k) || {});
+    return row;
+  });
+  return { columns, rows };
+}
+
+function transformFrames(panel, results) {
+  let { columns, rows } = applyJoinByField(panel, results);
+  ({ columns, rows } = applyCalculateFields(panel, columns, rows));
+  ({ columns, rows } = applyFilterFields(panel, columns, rows));
+  columns = orderColumns(panel, columns);
+  return { columns, rows };
+}
+
+function reduceField(rows, col, calc) {
+  const vals = [];
+  for (const r of rows || []) {
+    const n = num(r[col]);
+    if (n != null) vals.push(n);
+  }
+  if (!vals.length) return (rows || [])[0]?.[col];
+  const name = String(calc || "lastNotNull").toLowerCase();
+  if (name === "sum") return vals.reduce((a, b) => a + b, 0);
+  if (name === "mean" || name === "avg") return vals.reduce((a, b) => a + b, 0) / vals.length;
+  if (name === "max") return Math.max(...vals);
+  if (name === "min") return Math.min(...vals);
+  if (name === "first" || name === "firstnotnull") return vals[0];
+  return vals[vals.length - 1];
 }
 
 function orderColumns(panel, columns) {
@@ -558,14 +693,6 @@ function sortRowsByDate(cols, rows) {
   return rows.slice().sort((a, b) => toSortTime(b[col]) - toSortTime(a[col]));
 }
 
-function panelTableData(panel, results) {
-  let { columns, rows } = mergeFrames(results);
-  ({ columns, rows } = applyCalculateFields(panel, columns, rows));
-  columns = orderColumns(panel, columns);
-  rows = sortRowsByDate(columns, rows);
-  return { columns, rows };
-}
-
 function emptyCol(rows, col) {
   return !(rows || []).some((r) => r[col] != null && r[col] !== "");
 }
@@ -596,39 +723,14 @@ function drawTable(body, panel, cols, rows) {
 
 function draw(body, panel, results) {
   const type = panel.type;
-  const tabled = type === "table" ? panelTableData(panel, results) : null;
-  const rows = tabled ? tabled.rows : results[0].rows || [];
-  const cols = tabled ? tabled.columns : results[0].columns || [];
+  let { columns: cols, rows } = transformFrames(panel, results);
+  if (type === "table") rows = sortRowsByDate(cols, rows);
   if (type === "bargauge") {
     drawBarGauge(body, panel, cols, rows);
     return;
   }
   if (type === "stat" || type === "gauge") {
-    const row = rows[0] || {};
-    const show = prettyCols(cols, panel);
-    const key = show.find((c) => c !== "time") || show[0];
-    const rawKey = (cols || []).find((c) => c !== "time") || cols[0];
-    const defaultsUnit = panel.fieldConfig?.defaults?.unit || "";
-    const wantTime =
-      defaultsUnit === "dateTimeAsLocal" || /time/i.test(panel.options?.reduceOptions?.fields || "");
-    const valKey = wantTime ? cols.find((c) => c === "time" || c === "date") || rawKey : key || rawKey;
-    const val = row[valKey];
-    const mapped = mapValue(panel, val);
-    const text = formatStat(panel, val, valKey, mapped);
-    const unitLbl = statUnit(panel, valKey, val, mapped);
-    const color = mapped.color ? ` style="color:${mapped.color}"` : "";
-    const unitHtml = unitLbl ? `<span class="stat-unit">${escapeHtml(unitLbl)}</span>` : "";
-    body.innerHTML = `<div class="stat"${color}><span class="stat-val">${escapeHtml(text)}</span>${unitHtml}</div>`;
-    if (type !== "stat") {
-      const n = typeof val === "number" ? val : Number(val);
-      if (Number.isFinite(n)) {
-        const unit = fieldOverride(panel, valKey).unit || defaultsUnit;
-        const pct = isPercentUnit(unit, valKey, n)
-          ? Math.max(0, Math.min(100, n <= 1.5 ? n * 100 : n))
-          : Math.max(0, Math.min(100, n));
-        body.innerHTML += `<div class="gauge-bar"><span style="width:${pct}%;background:${mapped.color || "var(--accent)"}"></span></div>`;
-      }
-    }
+    drawStat(body, panel, cols, rows, type);
     return;
   }
   if (type === "table") {
@@ -636,23 +738,7 @@ function draw(body, panel, results) {
     return;
   }
   if (type === "geomap") {
-    const map = L.map(body).setView([54, -2], 6);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "&copy; OSM",
-      maxZoom: 19,
-    }).addTo(map);
-    const latKey = cols.find((c) => /lat/i.test(c));
-    const lonKey = cols.find((c) => /lon|lng/i.test(c));
-    const pts = [];
-    for (const r of rows) {
-      const la = Number(r[latKey]);
-      const lo = Number(r[lonKey]);
-      if (Number.isFinite(la) && Number.isFinite(lo)) pts.push([la, lo]);
-    }
-    if (pts.length) {
-      L.polyline(pts, { color: "#e85d04", weight: 3 }).addTo(map);
-      map.fitBounds(pts, { padding: [16, 16] });
-    }
+    drawGeomap(body, panel, cols, rows);
     return;
   }
   if (type === "piechart") {
@@ -680,7 +766,11 @@ function draw(body, panel, results) {
     drawBarChart(body, panel, cols, rows);
     return;
   }
-  if (type === "timeseries" || type === "xychart" || type === "heatmap") {
+  if (type === "heatmap") {
+    drawHeatmap(body, panel, cols, rows);
+    return;
+  }
+  if (type === "timeseries" || type === "xychart") {
     drawChart(body, panel, cols, rows, results);
     return;
   }
@@ -704,13 +794,13 @@ const STATE_FALLBACK = {
 };
 
 function mappingTable(panel) {
-  const out = { ...STATE_FALLBACK };
+  const out = {};
   const maps = panel.fieldConfig?.defaults?.mappings || [];
   for (const m of maps) {
     if (m.type !== "value" || !m.options) continue;
     for (const [k, v] of Object.entries(m.options)) {
       if (k === "null" || !v) continue;
-      out[k] = { text: v.text || k, color: v.color || out[k]?.color || "#8b93a7" };
+      out[k] = { text: v.text || k, color: v.color || STATE_FALLBACK[k]?.color || "#8b93a7" };
     }
   }
   return out;
@@ -719,9 +809,90 @@ function mappingTable(panel) {
 function mapValue(panel, val) {
   const table = mappingTable(panel);
   const key = val == null ? "null" : String(val);
-  const hit = table[key] || table[String(key).toLowerCase()] || STATE_FALLBACK[key];
+  const hit =
+    table[key] ||
+    table[String(key).toLowerCase()] ||
+    (panel?.type === "state-timeline" ? STATE_FALLBACK[key] || STATE_FALLBACK[String(key).toLowerCase()] : null);
   if (hit) return { text: hit.text, color: hit.color, mapped: true };
   return { text: val == null ? "–" : String(val), color: null, mapped: false };
+}
+
+function fieldDisplayName(panel, col) {
+  const props = fieldOverride(panel, col);
+  const dn = props.displayName || ciGet(organizeOpts(panel).renameByName, col);
+  if (dn && String(dn).trim()) return String(dn).replace(/:\s*$/, "");
+  return "";
+}
+
+function setPanelHeading(body, text) {
+  const h3 = body?.previousElementSibling;
+  if (!h3 || h3.tagName !== "H3" || String(h3.textContent || "").trim()) return;
+  h3.textContent = text;
+}
+
+function statFieldName(panel, col, rows, metricCol) {
+  let name = fieldDisplayName(panel, col) || String(panel.fieldConfig?.defaults?.displayName || "");
+  if (name.includes("${__cell_0}") || name.includes("$__cell_0")) {
+    const r0 = rows[0] || {};
+    name = String(r0[metricCol] ?? r0[col] ?? "");
+  }
+  if (!name && metricCol && rows[0]?.[metricCol] != null) name = String(rows[0][metricCol]);
+  if (!name) name = prettyCol(col) || col || "";
+  return interpTitle(String(name).replace(/:\s*$/, ""), vars(), panel);
+}
+
+function drawStat(body, panel, cols, rows, type) {
+  const calc = (panel.options?.reduceOptions?.calcs || panel.options?.fieldOptions?.calcs || ["lastNotNull"])[0];
+  const textMode = panel.options?.textMode || "auto";
+  const defaultsUnit = panel.fieldConfig?.defaults?.unit || "";
+  const wantTime =
+    defaultsUnit === "dateTimeAsLocal" || /time/i.test(panel.options?.reduceOptions?.fields || "");
+  const show = prettyCols(cols, panel);
+  const metricCol = show.find((c) => /^(metric|name)$/i.test(c));
+  let fields = show.filter((c) => c !== metricCol && c !== "time");
+  const numeric = fields.filter((c) => rows.some((r) => num(r[c]) != null));
+  if (numeric.length) fields = numeric;
+  if (wantTime) {
+    const tcol = cols.find((c) => c === "time" || c === "date") || fields[0];
+    fields = tcol ? [tcol] : fields;
+  }
+  if (!fields.length) fields = show.filter((c) => c !== "time");
+  const items = fields.map((col) => {
+    const val = wantTime ? (rows[rows.length - 1] || {})[col] : reduceField(rows, col, calc);
+    const mapped = mapValue(panel, val);
+    return {
+      col,
+      val,
+      mapped,
+      name: statFieldName(panel, col, rows, metricCol),
+      text: formatStat(panel, val, col, mapped),
+      unit: statUnit(panel, col, val, mapped),
+    };
+  });
+  const untitled = !String(panel.title || "").trim();
+  const showName = textMode === "value_and_name" || textMode === "name" || (textMode === "auto" && untitled);
+  const htmlFor = (it, named) => {
+    const color = it.mapped?.color ? ` style="color:${it.mapped.color}"` : "";
+    const name = named && it.name ? `<span class="stat-name">${escapeHtml(it.name)}</span>` : "";
+    const unit = it.unit ? `<span class="stat-unit">${escapeHtml(it.unit)}</span>` : "";
+    return `<div class="stat"${color}>${name}<span class="stat-val">${escapeHtml(it.text || "–")}</span>${unit}</div>`;
+  };
+  if (items.length > 1) {
+    body.innerHTML = `<div class="stat-grid">${items.map((it) => htmlFor(it, true)).join("")}</div>`;
+    return;
+  }
+  const it = items[0] || { text: "–", name: "", unit: "", mapped: {} };
+  if (showName && it.name) setPanelHeading(body, it.name);
+  body.innerHTML = htmlFor(it, false);
+  if (type === "stat") return;
+  const n = typeof it.val === "number" ? it.val : Number(it.val);
+  if (Number.isFinite(n)) {
+    const unit = fieldOverride(panel, it.col).unit || defaultsUnit;
+    const pct = isPercentUnit(unit, it.col, n)
+      ? Math.max(0, Math.min(100, n <= 1.5 ? n * 100 : n))
+      : Math.max(0, Math.min(100, n));
+    body.innerHTML += `<div class="gauge-bar"><span style="width:${pct}%;background:${it.mapped.color || "var(--accent)"}"></span></div>`;
+  }
 }
 
 function formatStat(panel, val, col, mapped) {
@@ -733,6 +904,7 @@ function formatStat(panel, val, col, mapped) {
   if (typeof val === "string" && !Number.isFinite(Number(val))) return val;
   const n = Number(val);
   if (!Number.isFinite(n)) return String(val);
+  if ((unit === "m" || unit === "min") && /duration/i.test(col || "")) return formatDuration(n * 60);
   if (isPercentUnit(unit, col, n) || unit === "percent") {
     const pct = unit === "percent" || n > 1.5 ? n : n * 100;
     return pct.toFixed(props.decimals ?? 1);
@@ -746,6 +918,7 @@ function statUnit(panel, col, val, mapped) {
   const props = fieldOverride(panel, col);
   const unit = props.unit || panel.fieldConfig?.defaults?.unit || "";
   if (unit === "dateTimeAsLocal" || unit === "s" || unit === "dtdurations") return "";
+  if ((unit === "m" || unit === "min") && /duration/i.test(col || "")) return "";
   if (typeof val === "string" && !Number.isFinite(Number(val))) return "";
   const n = Number(val);
   if (isPercentUnit(unit, col, n) || unit === "percent") return "%";
@@ -920,14 +1093,13 @@ function drawXyChart(el, panel, results) {
   const xs = [...new Set(parsed.flatMap((s) => s.pts.map((p) => p[0])))].sort((a, b) => a - b);
   const series = [{ label: headerLabel(panel, parsed[0].x) }];
   const data = [xs];
-  const palette = ["#e85d04", "#c4162a", "#3274d9"];
   parsed.forEach((s, i) => {
     const lookup = new Map(s.pts);
     data.push(xs.map((x) => (lookup.has(x) ? lookup.get(x) : null)));
     const line = panel.fieldConfig?.overrides?.some((o) => o.properties?.some((p) => p.id === "custom.show" && p.value === "lines")) && i > 0;
     series.push({
       label: s.label,
-      stroke: palette[i % palette.length],
+      stroke: seriesStroke(panel, s.y, i),
       width: line || parsed.length === 1 ? 1.5 : i === 0 ? 0 : 1.5,
       points: { show: i === 0, size: 6 },
     });
@@ -965,7 +1137,7 @@ function drawBarGauge(el, panel, cols, rows) {
   const slice = rows.slice(0, 25);
   el.innerHTML = `<div class="bargauge">${slice
     .map((r) => {
-      const n = num(r[valCol]);
+      const n = num(r[valCol]) ?? show.map((c) => (c === nameCol ? null : num(r[c]))).find((x) => x != null) ?? null;
       const pct = n == null ? 0 : Math.max(0, Math.min(100, (n / max) * 100));
       const label = r[nameCol] == null ? "" : String(r[nameCol]);
       const color = thresholdColor(panel.fieldConfig?.defaults?.thresholds?.steps, n) || "var(--accent)";
@@ -974,7 +1146,11 @@ function drawBarGauge(el, panel, cols, rows) {
     .join("")}</div>`;
 }
 
-const PIE_COLORS = ["#73BF69", "#FF9830", "#3274D9", "#e85d04", "#8F3BB8", "#6ED0E0"];
+const SERIES_COLORS = ["#73BF69", "#FF9830", "#3274D9", "#e85d04", "#8F3BB8", "#6ED0E0", "#E02F44", "#FADE2A"];
+
+function seriesStroke(panel, name, i) {
+  return sliceColor(panel, name, i);
+}
 
 function sliceColor(panel, name, i) {
   const props = fieldOverride(panel, name);
@@ -982,7 +1158,7 @@ function sliceColor(panel, name, i) {
   if (raw) return namedColor(raw) || raw;
   if (/dc/i.test(name) && !/ac/i.test(name)) return "#FF9830";
   if (/\bac\b/i.test(name)) return "#73BF69";
-  return PIE_COLORS[i % PIE_COLORS.length];
+  return SERIES_COLORS[i % SERIES_COLORS.length];
 }
 
 function formatPieValue(panel, n, col) {
@@ -1115,24 +1291,136 @@ function drawBarChart(el, panel, cols, rows) {
       .join("")}</div>`;
 }
 
+function drawGeomap(el, panel, cols, rows) {
+  const map = L.map(el).setView([54, -2], 6);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OSM",
+    maxZoom: 19,
+  }).addTo(map);
+  const latKey = cols.find((c) => /lat/i.test(c));
+  const lonKey = cols.find((c) => /lon|lng/i.test(c));
+  const layerType = (panel.options?.layers || []).map((l) => l.type).find(Boolean) || "route";
+  const pts = [];
+  if (layerType === "markers") {
+    const nameKey = cols.find((c) => /loc|name|address/i.test(c));
+    const sizeKey = cols.find((c) => /chg_total|charges|energy/i.test(c));
+    const sizes = rows.map((r) => Number(r[sizeKey])).filter((n) => Number.isFinite(n));
+    const maxS = Math.max(...sizes, 1);
+    for (const r of rows) {
+      const la = Number(r[latKey]);
+      const lo = Number(r[lonKey]);
+      if (!Number.isFinite(la) || !Number.isFinite(lo)) continue;
+      pts.push([la, lo]);
+      const n = Number(r[sizeKey]);
+      const rad = 6 + (Number.isFinite(n) ? (n / maxS) * 14 : 0);
+      const m = L.circleMarker([la, lo], { radius: rad, color: "#e85d04", fillOpacity: 0.7, weight: 1 }).addTo(map);
+      const label = [r[nameKey], Number.isFinite(n) ? formatNum(n) : null].filter(Boolean).join(" · ");
+      if (label) m.bindTooltip(label);
+    }
+  } else {
+    for (const r of rows) {
+      const la = Number(r[latKey]);
+      const lo = Number(r[lonKey]);
+      if (Number.isFinite(la) && Number.isFinite(lo)) pts.push([la, lo]);
+    }
+    if (pts.length) L.polyline(pts, { color: "#e85d04", weight: 3 }).addTo(map);
+  }
+  if (pts.length) map.fitBounds(pts, { padding: [16, 16] });
+}
+
+function drawHeatmap(el, panel, cols, rows) {
+  if (!rows.length) {
+    el.innerHTML = '<div class="err">no data</div>';
+    return;
+  }
+  const timeCol = cols.find((c) => c === "time" || isTimeColumn(c, rows)) || cols[0];
+  const startCol =
+    cols.find((c) => /start_battery/i.test(c)) || cols.find((c) => /start/i.test(c) && c !== timeCol);
+  const endCol = cols.find((c) => /end_battery/i.test(c)) || cols.find((c) => /end/i.test(c) && c !== timeCol);
+  const y0 = startCol || cols.find((c) => c !== timeCol);
+  const y1 = endCol || y0;
+  const step = 5;
+  const bands = [];
+  for (let s = 100; s >= 0; s -= step) bands.push(s);
+  const slice = rows.slice(0, 48);
+  el.innerHTML = `<div class="heatmap"><div class="hm-grid" style="grid-template-columns: 2.2em repeat(${slice.length}, minmax(8px, 1fr))">${bands
+    .map((b) => {
+      const cells = slice
+        .map((r) => {
+          const a = Number(r[y0]);
+          const c = Number(r[y1]);
+          if (!Number.isFinite(a) && !Number.isFinite(c)) return '<i></i>';
+          const lo = Math.min(Number.isFinite(a) ? a : c, Number.isFinite(c) ? c : a);
+          const hi = Math.max(Number.isFinite(a) ? a : c, Number.isFinite(c) ? c : a);
+          const on = b <= hi && b + step > lo;
+          const t = formatTime(r[timeCol]);
+          return `<i class="${on ? "on" : ""}" title="${escapeHtml(`${t} · ${lo.toFixed(0)}–${hi.toFixed(0)}%`)}"></i>`;
+        })
+        .join("");
+      return `<b>${b}</b>${cells}`;
+    })
+    .join("")}</div></div>`;
+}
+
+function chartTimeCol(cols, rows) {
+  return (
+    (cols || []).find((c) => c === "time" || c === "series_id") ||
+    (cols || []).find((c) => isTimeColumn(c, rows)) ||
+    null
+  );
+}
+
+function timeSeriesFrames(results, cols, rows) {
+  const frames = (results || []).filter((f) => f && f.ok !== false && (f.rows || []).length);
+  const timed = frames.filter((f) => chartTimeCol(f.columns, f.rows));
+  if (timed.length) return timed;
+  if ((rows || []).length && chartTimeCol(cols, rows)) return [{ columns: cols, rows }];
+  return [];
+}
+
 function drawChart(el, panel, cols, rows, results) {
   if (panel?.type === "xychart") {
     drawXyChart(el, panel, results && results.length ? results : [{ ok: true, columns: cols, rows }]);
     return;
   }
-  if (!rows.length) {
+  const frames = timeSeriesFrames(results, cols, rows);
+  const points = new Map();
+  const ys = [];
+  const ySeen = new Set();
+  for (const f of frames) {
+    const tcol = chartTimeCol(f.columns, f.rows);
+    for (const c of f.columns || []) {
+      if (c === tcol || hiddenCol(c, panel) || /^(lower|upper)$/i.test(c)) continue;
+      if (!f.rows.some((r) => num(r[c]) != null)) continue;
+      if (!ySeen.has(c)) {
+        ySeen.add(c);
+        ys.push(c);
+      }
+    }
+    for (const r of f.rows || []) {
+      const x = toEpoch(r[tcol]) ?? num(r[tcol]);
+      if (x == null) continue;
+      const rec = points.get(x) || {};
+      for (const c of ys) {
+        const n = num(r[c]);
+        if (n != null) rec[c] = n;
+      }
+      points.set(x, rec);
+    }
+  }
+  const xs = [...points.keys()].sort((a, b) => a - b);
+  if (!xs.length || !ys.length) {
     el.innerHTML = '<div class="err">no data</div>';
     return;
   }
-  const timeCol =
-    cols.find((c) => c === "time") ||
-    cols.find((c) => isTimeColumn(c, rows)) ||
-    cols[0];
-  const ys = cols.filter((c) => c !== timeCol && !hiddenCol(c, panel));
-  const timeScale = isTimeColumn(timeCol, rows);
-  const xs = rows.map((r) => (timeScale ? toEpoch(r[timeCol]) : num(r[timeCol])));
-  const series = [{ label: headerLabel(panel, timeCol) }].concat(ys.map((y) => ({ label: headerLabel(panel, y), stroke: "#e85d04", width: 1.5 })));
-  const data = [xs].concat(ys.map((y) => rows.map((r) => num(r[y]))));
+  const series = [{ label: "time" }].concat(
+    ys.map((y, i) => ({ label: headerLabel(panel, y), stroke: seriesStroke(panel, y, i), width: 1.5 }))
+  );
+  const data = [xs].concat(ys.map((y) => xs.map((x) => points.get(x)[y] ?? null)));
+  const yMin = panel.fieldConfig?.defaults?.min;
+  const yMax = panel.fieldConfig?.defaults?.max;
+  const scales = { x: { time: true } };
+  if (yMin != null || yMax != null) scales.y = { auto: false, min: yMin ?? 0, max: yMax ?? 100 };
   el.innerHTML = "";
   const plot = document.createElement("div");
   el.appendChild(plot);
@@ -1142,7 +1430,7 @@ function drawChart(el, panel, cols, rows, results) {
       height: Math.max(120, el.clientHeight - 8),
       series,
       axes: [{ stroke: "#8b93a7" }, { stroke: "#8b93a7" }],
-      scales: { x: { time: timeScale } },
+      scales,
     },
     data,
     plot
@@ -1173,6 +1461,7 @@ function fmt(v) {
 }
 
 async function boot() {
+  if (!(await tmAuth.route(await tmAuth.status()))) return;
   applyRange("30d");
   settings = await api("/api/settings");
   cars = await api("/api/cars");

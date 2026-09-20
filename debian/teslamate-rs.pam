@@ -1,0 +1,7 @@
+#%PAM-1.0
+# teslamate-rs web UI — password checks only (no login session).
+# Lockouts: nginx limit_req on /api/auth/ plus in-process throttling.
+# Data directory on packaged installs: /srv/teslamate-rs.
+# Optional host-wide lockout: enable pam_faillock via pam-auth-update / faillock.conf.
+@include common-auth
+@include common-account

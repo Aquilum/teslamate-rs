@@ -6,6 +6,10 @@
 export CARGO_TARGET_DIR := $(CURDIR)/debian/cargo-target
 export CARGO_HOME ?= $(HOME)/.cargo
 export PATH := $(HOME)/.cargo/bin:$(PATH)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+PAM_LIBDIR := $(CURDIR)/debian/pamlib
+# Link against libpam.so.0 when libpam0g-dev (libpam.so) is not installed.
+export RUSTFLAGS += -L native=$(PAM_LIBDIR)
 
 ifeq (,$(filter network,$(DEB_BUILD_OPTIONS)))
   export DEB_BUILD_OPTIONS := $(DEB_BUILD_OPTIONS) network
@@ -15,6 +19,11 @@ endif
 	dh $@
 
 override_dh_auto_configure:
+	mkdir -p $(PAM_LIBDIR)
+	if [ ! -e /usr/lib/$(DEB_HOST_MULTIARCH)/libpam.so ] && [ ! -e /lib/$(DEB_HOST_MULTIARCH)/libpam.so ]; then \
+		soname=$$(ls /lib/$(DEB_HOST_MULTIARCH)/libpam.so.0 /usr/lib/$(DEB_HOST_MULTIARCH)/libpam.so.0 2>/dev/null | head -1); \
+		[ -n "$$soname" ] && ln -sfn "$$soname" $(PAM_LIBDIR)/libpam.so; \
+	fi
 
 override_dh_auto_build:
 	cargo build --release --locked --bin teslamate-rs
@@ -26,9 +35,11 @@ override_dh_auto_install:
 		debian/teslamate-rs/usr/bin/teslamate-rs
 	install -D -m 0644 debian/teslamate-rs.default \
 		debian/teslamate-rs/etc/default/teslamate-rs
+	install -D -m 0644 debian/teslamate-rs.pam \
+		debian/teslamate-rs/etc/pam.d/teslamate-rs
 
 override_dh_auto_clean:
-	rm -rf debian/cargo-target
+	rm -rf debian/cargo-target debian/pamlib
 
 override_dh_dwz:
 	# Release binary is already stripped (Cargo.toml strip = true).
