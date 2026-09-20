@@ -1,0 +1,16 @@
+/target
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+/teslamate-rs.sqlite*
+*.deb
+/debian/cargo-target
+/debian/files
+/debian/teslamate-rs
+/debian/*.substvars
+/debian/*.debhelper
+/debian/*.debhelper.log
+/debian/.debhelper
+/debian/debhelper-build-stamp
+

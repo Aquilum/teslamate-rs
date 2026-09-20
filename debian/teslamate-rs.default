@@ -1,0 +1,6 @@
+# teslamate-rs environment (sourced by systemd). Uncomment to override.
+# TESLAMATE_RS_HOME=/srv/teslamate-rs
+# TESLAMATE_RS_DB=/srv/teslamate-rs/teslamate-rs.sqlite
+# TESLAMATE_RS_BIND=127.0.0.1
+# TESLAMATE_RS_PORT=4010
+# TESLAMATE_RS_NO_LOGGER=1

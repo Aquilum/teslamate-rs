@@ -1,0 +1,6 @@
+tar-ignore = "target"
+tar-ignore = "debian/cargo-target"
+tar-ignore = ".git"
+tar-ignore = "*.sqlite"
+tar-ignore = "*.sqlite-wal"
+tar-ignore = "*.sqlite-shm"

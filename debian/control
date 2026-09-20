@@ -1,0 +1,31 @@
+Source: teslamate-rs
+Section: net
+Priority: optional
+Maintainer: Tom Dewey <tom@fleetcom.org>
+Build-Depends:
+ debhelper-compat (= 13),
+ devscripts,
+ cargo,
+ rustc,
+ pkg-config,
+ gcc,
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: teslamate-rs
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ systemd,
+ adduser,
+Description: Single-process TeslaMate (Rust + SQLite)
+ teslamate-rs is a RAM-saving TeslaMate rewrite: Rust binary, SQLite,
+ and a built-in Grafana-parity dashboard UI in one process.
+ .
+ The daemon listens on 127.0.0.1:4010 by default. Service data (SQLite
+ database and WAL files) lives in /srv/teslamate-rs. Override bind, port,
+ and database path via /etc/default/teslamate-rs.
+ .
+ This package does not replace a live Docker TeslaMate install; it binds
+ a different port (4010 vs 4000).

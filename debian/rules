@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+# teslamate-rs is built with the rust-toolchain.toml pin (1.98.1) via rustup
+# when ~/.cargo/bin is on PATH. Cargo may fetch crates (like koeler's network
+# Drogon fetch); sbuild/pbuilder need network if the crate cache is empty.
+
+export CARGO_TARGET_DIR := $(CURDIR)/debian/cargo-target
+export CARGO_HOME ?= $(HOME)/.cargo
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+
+ifeq (,$(filter network,$(DEB_BUILD_OPTIONS)))
+  export DEB_BUILD_OPTIONS := $(DEB_BUILD_OPTIONS) network
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --release --locked --bin teslamate-rs
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0755 $(CARGO_TARGET_DIR)/release/teslamate-rs \
+		debian/teslamate-rs/usr/bin/teslamate-rs
+	install -D -m 0644 debian/teslamate-rs.default \
+		debian/teslamate-rs/etc/default/teslamate-rs
+
+override_dh_auto_clean:
+	rm -rf debian/cargo-target
+
+override_dh_dwz:
+	# Release binary is already stripped (Cargo.toml strip = true).
+
+override_dh_installsystemd:
+	dh_installsysusers
+	dh_installsystemd --restart-after-upgrade

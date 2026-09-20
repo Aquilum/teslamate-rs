@@ -1,0 +1,6 @@
+teslamate-rs (0.1.0-1) UNRELEASED; urgency=medium
+
+  * Initial Debian package.
+  * Default service data directory is /srv/teslamate-rs.
+
+ -- Tom Dewey <tom@fleetcom.org>  Sun, 20 Sep 2026 17:35:00 +0100

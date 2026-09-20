@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>teslamate-rs</title>
+  <link rel="stylesheet" href="/vendor/leaflet.css">
+  <link rel="stylesheet" href="/vendor/uPlot.min.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <aside id="nav">
+    <div class="brand">teslamate-rs</div>
+    <div id="nav-list"></div>
+  </aside>
+  <main>
+    <header id="toolbar">
+      <h1 id="title">Overview</h1>
+      <div class="controls">
+        <label>Car <select id="car"></select></label>
+        <label>From <input type="datetime-local" id="from"></label>
+        <label>To <input type="datetime-local" id="to"></label>
+        <div class="presets">
+          <button data-range="1d">24h</button>
+          <button data-range="7d">7d</button>
+          <button data-range="30d">30d</button>
+          <button data-range="90d">90d</button>
+          <button data-range="1y">1y</button>
+          <button data-range="all">All</button>
+        </div>
+      </div>
+    </header>
+    <div id="board"></div>
+  </main>
+  <script src="/vendor/leaflet.js"></script>
+  <script src="/vendor/uPlot.iife.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

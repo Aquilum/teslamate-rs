@@ -1,0 +1,19 @@
+teslamate-rs for Debian
+-----------------------
+
+Data directory
+  SQLite lives at /srv/teslamate-rs/teslamate-rs.sqlite (WAL files alongside).
+  Removing the package does not delete that directory.
+
+Service
+  systemd unit teslamate-rs.service binds 127.0.0.1:4010 and does not start
+  the Tesla Owner API logger until tokens are stored (teslamate-rs login).
+  Override bind/port/database in /etc/default/teslamate-rs.
+
+  This package is meant to sit beside Docker TeslaMate (port 4000), not
+  replace it.
+
+Build
+  dpkg-buildpackage -us -uc -b -d
+  Requires rustc 1.98.1 (rust-toolchain.toml). rustup's cargo is used when
+  ~/.cargo/bin is on PATH; -d skips the apt cargo/rustc build-depends.
