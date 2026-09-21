@@ -12,6 +12,7 @@ mod seed;
 mod server;
 mod sql;
 mod tesla;
+mod token_crypto;
 mod tokens;
 mod users;
 

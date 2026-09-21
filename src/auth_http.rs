@@ -34,14 +34,18 @@ pub fn router() -> Router<App> {
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("local")
-        .to_string()
+    if auth::trust_proxy() {
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_string();
+        }
+    }
+    "local".to_string()
 }
 
 fn rate_limit(app: &App, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
@@ -351,6 +355,7 @@ async fn wa_register_finish(
     State(app): State<App>,
     headers: HeaderMap,
     jar: CookieJar,
+    user: OptionalUser,
     Json(body): Json<WebauthnFinish>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
     let challenge_id = jar
@@ -373,9 +378,18 @@ async fn wa_register_finish(
     let mut jar = jar.remove(app.auth.wa_cookie_key(&headers));
     match challenge.purpose.as_str() {
         "add" => {
+            let session = user
+                .0
+                .ok_or_else(|| api_err(StatusCode::UNAUTHORIZED, "sign in required"))?;
             let user_id = challenge
                 .user_id
                 .ok_or_else(|| api_err(StatusCode::BAD_REQUEST, "not signed in"))?;
+            if session.id != user_id {
+                return Err(api_err(
+                    StatusCode::FORBIDDEN,
+                    "passkey challenge does not match this session",
+                ));
+            }
             store_passkey(&app.db, user_id, &passkey).map_err(internal_err)?;
             Ok((jar, Json(json!({ "ok": true }))))
         }

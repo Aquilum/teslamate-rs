@@ -103,30 +103,60 @@ pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
             return forced.trim_end_matches('/').to_string();
         }
     }
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if fallback.starts_with("https://") {
-                "https"
-            } else {
-                "http"
-            }
-        });
+    let host = if trust_proxy() {
+        headers
+            .get("x-forwarded-host")
+            .or_else(|| headers.get(header::HOST))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    } else {
+        headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let proto = if trust_proxy() {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if fallback.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                }
+            })
+    } else if fallback.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
     if let Some(host) = host {
         return format!("{proto}://{host}");
     }
     fallback.trim_end_matches('/').to_string()
+}
+
+/// Honor `X-Forwarded-*` / `X-Real-IP` only when explicitly enabled (or when the
+/// WebAuthn origin is pinned, which implies a trusted reverse proxy).
+pub fn trust_proxy() -> bool {
+    match std::env::var("TESLAMATE_RS_TRUST_PROXY") {
+        Ok(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some(),
+    }
 }
 
 fn rp_id_for_origin(origin: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -236,7 +266,13 @@ pub async fn pam_provision_user(
         })
         .await
         .map_err(internal_err)?;
-        if exists && !member {
+        if !exists {
+            tracing::error!(
+                "PAM group {group} does not exist; refusing sign-in until it is created"
+            );
+            return Err(denied());
+        }
+        if !member {
             return Err(denied());
         }
     }
@@ -470,6 +506,10 @@ mod tests {
 
     #[test]
     fn origin_follows_nginx_forwarded_https() {
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "tm.example.com".parse().unwrap());
@@ -479,6 +519,38 @@ mod tests {
         let state = AuthState::new("localhost", "http://localhost:4010").unwrap();
         assert!(state.secure_from(&headers));
         assert_eq!(state.rp_id_from(&headers), "tm.example.com");
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
+    }
+
+    #[test]
+    fn forwarded_headers_ignored_without_trust_proxy() {
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::remove_var("TESLAMATE_RS_TRUST_PROXY");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
+        assert_eq!(
+            public_origin(&headers, "http://localhost:4010"),
+            "http://127.0.0.1:4010"
+        );
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
     }
 
     #[test]

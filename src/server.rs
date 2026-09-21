@@ -52,8 +52,8 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
             tracing::info!("password backend: PAM (service={service}, {group})");
             if let Some(group) = crate::pam_auth::required_group() {
                 if !crate::pam_auth::group_exists(&group) {
-                    tracing::warn!(
-                        "group {group} does not exist yet; any PAM-authenticated user can sign in until you create it"
+                    tracing::error!(
+                        "group {group} does not exist; PAM sign-in is refused until you create it and add members"
                     );
                 }
             }
@@ -345,6 +345,7 @@ fn execute_dashboard_query(
     if let Some(payload) = query_stats_override(&sql, cache) {
         return payload;
     }
+    vars = sql::sanitize_vars(vars);
     if sql.contains("$aux") && !vars.extras.contains_key("aux") {
         let conn = db.read();
         if cancelled.load(Ordering::Relaxed) {
@@ -363,6 +364,12 @@ fn execute_dashboard_query(
         sql::translate(&sql, &vars)
     }))
     .unwrap_or_else(|_| sql.clone());
+    if let Err(msg) = sql::assert_safe_dashboard_sql(&translated) {
+        return json!({
+            "ok": false,
+            "error": msg,
+        });
+    }
     let key = cache_key(&translated);
     let t0 = Instant::now();
     if let Some(hit) = cache.get(key) {
@@ -501,6 +508,12 @@ async fn dbinfo(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, 
             .collect::<rusqlite::Result<_>>()?;
         let mut tables = Vec::new();
         for name in names {
+            if sql::FORBIDDEN_QUERY_TABLES
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |r| r.get(0))?;
             tables.push(json!({ "name": name, "rows": n }));
         }
@@ -566,6 +579,28 @@ mod query_cancel_tests {
         assert_eq!(v["rows"][0]["n"], json!(1));
         let again = execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
         assert_eq!(again["ok"], json!(true));
+    }
+
+    #[test]
+    fn query_rejects_oauth_tokens_table() {
+        let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let v = execute_dashboard_query(
+            &db,
+            &QueryCache::default(),
+            "SELECT access_token, refresh_token FROM oauth_tokens".into(),
+            vars(),
+            &cancelled,
+        );
+        assert_eq!(v["ok"], json!(false));
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("oauth_tokens"),
+            "{v}"
+        );
     }
 }
 

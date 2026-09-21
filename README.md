@@ -35,7 +35,9 @@ sudo systemctl enable --now teslamate-rs
 - `root` cannot sign in unless `TESLAMATE_RS_PAM_ALLOW_ROOT=1`.
 - `TESLAMATE_RS_AUTH=local` or `--auth local` restores the SQLite password database.
 
-On a **Linux host**, keep teslamate-rs on loopback and put **nginx TLS** in front so session cookies are `Secure` and passkeys match the public hostname. See `docs/nginx-teslamate-rs.conf`. Pin origin with `TESLAMATE_RS_WEBAUTHN_ORIGIN` / `TESLAMATE_RS_WEBAUTHN_RP_ID` if needed.
+On a **Linux host**, keep teslamate-rs on loopback and put **nginx TLS** in front so session cookies are `Secure` and passkeys match the public hostname. See `docs/nginx-teslamate-rs.conf`. Set `TESLAMATE_RS_TRUST_PROXY=1` and pin origin with `TESLAMATE_RS_WEBAUTHN_ORIGIN` / `TESLAMATE_RS_WEBAUTHN_RP_ID`. Forwarded headers are ignored unless trust-proxy (or a pinned origin) is enabled.
+
+Owner API tokens in SQLite are encrypted at rest (`TESLAMATE_RS_TOKEN_KEY` or `$TESLAMATE_RS_HOME/oauth.key`). Dashboard `/api/query` is SELECT-only and cannot read auth/token tables.
 
 Local development (no nginx):
 

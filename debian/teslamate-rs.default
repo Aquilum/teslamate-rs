@@ -9,3 +9,8 @@
 # TESLAMATE_RS_PAM_GROUP=teslamate-rs
 # TESLAMATE_RS_WEBAUTHN_ORIGIN=https://tm.example.com
 # TESLAMATE_RS_WEBAUTHN_RP_ID=tm.example.com
+# Required when nginx sets X-Forwarded-* (also implied if WEBAUTHN_ORIGIN is set):
+# TESLAMATE_RS_TRUST_PROXY=1
+# Optional 64-hex-char key for encrypting Owner API tokens at rest (otherwise
+# $TESLAMATE_RS_HOME/oauth.key is created automatically):
+# TESLAMATE_RS_TOKEN_KEY=
