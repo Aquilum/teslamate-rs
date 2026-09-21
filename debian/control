@@ -4,23 +4,58 @@ Priority: optional
 Maintainer: Tom Dewey <tom@fleetcom.org>
 Build-Depends:
  debhelper-compat (= 13),
- devscripts,
- cargo,
- rustc,
- pkg-config,
- gcc,
- libpam0g-dev | libpam0g,
-Standards-Version: 4.6.2
+ dh-cargo (>= 32),
+ dh-sequence-installsysusers,
+ libpam0g-dev,
+ librust-aes-gcm-0.10-dev,
+ librust-anyhow-1-dev,
+ librust-argon2-0.5-dev,
+ librust-axum-0.8+macros-dev,
+ librust-axum-extra-0.12+cookie-dev,
+ librust-base64-0.22-dev,
+ librust-chrono-0.4+clock-dev,
+ librust-chrono-0.4+serde-dev,
+ librust-clap-4+derive-dev,
+ librust-clap-4+env-dev,
+ librust-csv-1-dev,
+ librust-futures-util-0.3-dev,
+ librust-hex-0.4-dev,
+ librust-libc-0.2-dev,
+ librust-mime-guess-2-dev,
+ librust-parking-lot-0.12-dev,
+ librust-rand-0.8-dev,
+ librust-regex-1-dev,
+ librust-reqwest-0.12+json-dev,
+ librust-reqwest-0.12+rustls-tls-native-roots-dev,
+ librust-rusqlite-0.40+chrono-dev,
+ librust-rusqlite-0.40+functions-dev,
+ librust-rusqlite-0.40+hooks-dev,
+ librust-rust-embed-8-dev,
+ librust-serde-1+derive-dev,
+ librust-serde-json-1-dev,
+ librust-sha2-0.10-dev,
+ librust-thiserror-2-dev,
+ librust-time-0.3-dev,
+ librust-tokio-1+full-dev,
+ librust-tokio-tungstenite-0.28-dev,
+ librust-tower-http-0.6+trace-dev,
+ librust-tracing-0.1-dev,
+ librust-tracing-subscriber-0.3+env-filter-dev,
+ librust-url-2+serde-dev,
+ librust-uuid-1+serde-dev,
+ librust-uuid-1+v4-dev,
+Standards-Version: 4.7.2
+Homepage: https://github.com/teslamate-org/teslamate
 Rules-Requires-Root: no
 
 Package: teslamate-rs
 Architecture: any
+Built-Using: ${cargo:Built-Using}
+Static-Built-Using: ${cargo:Static-Built-Using}
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
- systemd,
- adduser,
- libpam0g,
+ ca-certificates,
 Description: Single-process TeslaMate (Rust + SQLite)
  teslamate-rs is a RAM-saving TeslaMate rewrite: Rust binary, SQLite,
  and a built-in Grafana-parity dashboard UI in one process.

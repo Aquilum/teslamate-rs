@@ -5,7 +5,9 @@
 .env
 /teslamate-rs.sqlite*
 *.deb
-/debian/cargo-target
+/debian/cargo_home
+/debian/cargo_registry
+/debian/cargo_out_dir
 /debian/files
 /debian/teslamate-rs
 /debian/*.substvars
@@ -14,3 +16,4 @@
 /debian/.debhelper
 /debian/debhelper-build-stamp
 
+/.cargo-checksum.json
