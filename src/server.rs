@@ -300,7 +300,12 @@ struct ClearProgress<'a>(&'a Connection);
 
 impl Drop for ClearProgress<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        // rusqlite 0.40 made this fallible. Nothing to propagate from a Drop,
+        // but a stale callback left on a pooled connection would keep firing
+        // against a dead cancellation flag, so it is worth knowing about.
+        if let Err(e) = self.0.progress_handler(0, None::<fn() -> bool>) {
+            tracing::warn!("could not clear sqlite progress handler: {e}");
+        }
     }
 }
 
@@ -377,7 +382,11 @@ fn execute_dashboard_query(
         return cancelled_json();
     }
     let flag = cancelled.clone();
-    conn.progress_handler(250, Some(move || flag.load(Ordering::Relaxed)));
+    // If this fails the query still runs, it just cannot be interrupted by a
+    // disconnecting client, so warn rather than failing the request.
+    if let Err(e) = conn.progress_handler(250, Some(move || flag.load(Ordering::Relaxed))) {
+        tracing::warn!("query cancellation unavailable: {e}");
+    }
     let _clear = ClearProgress(&conn);
     let mut stmt = match conn.prepare(&translated) {
         Ok(s) => s,

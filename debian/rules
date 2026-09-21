@@ -1,49 +1,46 @@
 #!/usr/bin/make -f
-# teslamate-rs is built with the rust-toolchain.toml pin (1.98.1) via rustup
-# when ~/.cargo/bin is on PATH. Cargo may fetch crates (like koeler's network
-# Drogon fetch); sbuild/pbuilder need network if the crate cache is empty.
 
-export CARGO_TARGET_DIR := $(CURDIR)/debian/cargo-target
-export CARGO_HOME ?= $(HOME)/.cargo
-export PATH := $(HOME)/.cargo/bin:$(PATH)
-DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
-PAM_LIBDIR := $(CURDIR)/debian/pamlib
-# Link against libpam.so.0 when libpam0g-dev (libpam.so) is not installed.
-export RUSTFLAGS += -L native=$(PAM_LIBDIR)
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
 
-ifeq (,$(filter network,$(DEB_BUILD_OPTIONS)))
-  export DEB_BUILD_OPTIONS := $(DEB_BUILD_OPTIONS) network
-endif
+# Cargo.toml asks for fat LTO with codegen-units = 1. Linking 169 crates
+# that way, with the -C debuginfo=2 Debian needs for the dbgsym package,
+# peaks high enough to get the build OOM-killed on a normal machine.
+# "optimize=+lto" is read by /usr/share/cargo/bin/cargo and downgrades it
+# to thin LTO, which keeps most of the benefit at a fraction of the peak.
+# Use optimize=-lto to turn LTO off altogether if this is still too much.
+export DEB_BUILD_OPTIONS += optimize=+lto
 
+# The Debian cargo wrapper expects these to be exported; see the header of
+# /usr/share/cargo/bin/cargo. teslamate-rs links libpam through the C ABI,
+# so the hardening LDFLAGS do matter here.
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildflags.mk
+include /usr/share/rustc/architecture.mk
+export CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+export DEB_HOST_RUST_TYPE DEB_HOST_GNU_TYPE
+
+# webauthn-rs is not packaged in Debian, so build without the "passkeys"
+# feature. PAM and password authentication are unaffected.
+# See debian/README.source.
+CARGO_ARGS = --no-default-features
+
+# The installsysusers sequence comes from the dh-sequence-installsysusers
+# build dependency. dh_installsysusers only joins the default sequence at
+# compat 14; without it the teslamate-rs user is never created,
+# systemd-tmpfiles cannot chown /srv/teslamate-rs, and the unit fails to
+# start because its User= does not exist.
 %:
-	dh $@
-
-override_dh_auto_configure:
-	mkdir -p $(PAM_LIBDIR)
-	if [ ! -e /usr/lib/$(DEB_HOST_MULTIARCH)/libpam.so ] && [ ! -e /lib/$(DEB_HOST_MULTIARCH)/libpam.so ]; then \
-		soname=$$(ls /lib/$(DEB_HOST_MULTIARCH)/libpam.so.0 /usr/lib/$(DEB_HOST_MULTIARCH)/libpam.so.0 2>/dev/null | head -1); \
-		[ -n "$$soname" ] && ln -sfn "$$soname" $(PAM_LIBDIR)/libpam.so; \
-	fi
-
-override_dh_auto_build:
-	cargo build --release --locked --bin teslamate-rs
+	dh $@ --buildsystem=cargo
 
 override_dh_auto_test:
+	dh_auto_test -- test $(CARGO_ARGS)
 
+# dh-cargo installs the binary from [[bin]] into /usr/bin; the conffiles are
+# ours and are not covered by the cargo buildsystem.
 override_dh_auto_install:
-	install -D -m 0755 $(CARGO_TARGET_DIR)/release/teslamate-rs \
-		debian/teslamate-rs/usr/bin/teslamate-rs
+	dh_auto_install -- $(CARGO_ARGS)
 	install -D -m 0644 debian/teslamate-rs.default \
 		debian/teslamate-rs/etc/default/teslamate-rs
 	install -D -m 0644 debian/teslamate-rs.pam \
 		debian/teslamate-rs/etc/pam.d/teslamate-rs
-
-override_dh_auto_clean:
-	rm -rf debian/cargo-target debian/pamlib
-
-override_dh_dwz:
-	# Release binary is already stripped (Cargo.toml strip = true).
-
-override_dh_installsystemd:
-	dh_installsysusers
-	dh_installsystemd --restart-after-upgrade

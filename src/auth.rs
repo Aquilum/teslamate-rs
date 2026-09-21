@@ -1,5 +1,6 @@
 //! teslamate-rs account authentication: passwords, passkeys, sessions.
 
+#[cfg(feature = "passkeys")]
 use std::sync::Arc;
 
 use argon2::password_hash::{rand_core::OsRng, SaltString};
@@ -17,6 +18,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
+#[cfg(feature = "passkeys")]
 use webauthn_rs::prelude::*;
 
 use crate::db::Db;
@@ -24,6 +26,7 @@ use crate::pam_auth;
 use crate::users::{self, User};
 
 pub const SESSION_COOKIE: &str = "teslamate_sid";
+#[cfg(feature = "passkeys")]
 pub const WA_COOKIE: &str = "teslamate_wa";
 
 pub trait HasAuthDb: Send + Sync {
@@ -32,6 +35,7 @@ pub trait HasAuthDb: Send + Sync {
 
 #[derive(Clone)]
 pub struct AuthState {
+    #[cfg(feature = "passkeys")]
     #[allow(dead_code)]
     pub webauthn: Arc<Webauthn>,
     pub secure_cookie: bool,
@@ -41,11 +45,15 @@ pub struct AuthState {
 
 impl AuthState {
     pub fn new(rp_id: &str, origin: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let url = Url::parse(origin)?;
-        let webauthn = WebauthnBuilder::new(rp_id, &url)?
+        // Parsed for validation even without passkeys: an unusable origin
+        // should fail here rather than at first request.
+        let _url = Url::parse(origin)?;
+        #[cfg(feature = "passkeys")]
+        let webauthn = WebauthnBuilder::new(rp_id, &_url)?
             .rp_name("teslamate-rs")
             .build()?;
         Ok(Self {
+            #[cfg(feature = "passkeys")]
             webauthn: Arc::new(webauthn),
             secure_cookie: origin.starts_with("https://"),
             rp_id: rp_id.to_string(),
@@ -60,6 +68,7 @@ impl AuthState {
         )
     }
 
+    #[cfg(feature = "passkeys")]
     pub fn wa_cookie(&self, id: &str, headers: &HeaderMap) -> Cookie<'static> {
         apply_cookie(Cookie::new(WA_COOKIE, id.to_owned()), self.secure_from(headers))
     }
@@ -68,6 +77,7 @@ impl AuthState {
         apply_cookie(Cookie::from(SESSION_COOKIE), self.secure_from(headers))
     }
 
+    #[cfg(feature = "passkeys")]
     pub fn wa_cookie_key(&self, headers: &HeaderMap) -> Cookie<'static> {
         apply_cookie(Cookie::from(WA_COOKIE), self.secure_from(headers))
     }
@@ -84,6 +94,7 @@ impl AuthState {
         rp_id_for_origin(&self.origin_from(headers)).unwrap_or_else(|_| self.rp_id.clone())
     }
 
+    #[cfg(feature = "passkeys")]
     pub fn webauthn_from(
         &self,
         headers: &HeaderMap,
@@ -399,6 +410,7 @@ pub fn uuid_from_user(user: &User) -> Result<Uuid, Box<dyn std::error::Error>> {
     Ok(Uuid::parse_str(&user.uuid)?)
 }
 
+#[cfg(feature = "passkeys")]
 pub fn passkeys_of(db: &Db, user_id: i64) -> Result<Vec<Passkey>, Box<dyn std::error::Error>> {
     let conn = db.lock();
     let rows = users::passkeys_for_user(&conn, user_id)?;
@@ -410,6 +422,7 @@ pub fn passkeys_of(db: &Db, user_id: i64) -> Result<Vec<Passkey>, Box<dyn std::e
     Ok(out)
 }
 
+#[cfg(feature = "passkeys")]
 pub fn store_passkey(
     db: &Db,
     user_id: i64,
@@ -422,6 +435,7 @@ pub fn store_passkey(
     Ok(())
 }
 
+#[cfg(feature = "passkeys")]
 pub fn update_stored_passkey(
     db: &Db,
     user_id: i64,

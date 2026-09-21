@@ -91,6 +91,16 @@ function showApp() {
   document.getElementById("app").hidden = false;
 }
 
+// Hide every passkey control when the server was built without the
+// "passkeys" feature; those routes are not registered and would 404.
+function applyPasskeySupport(st) {
+  if (st.webauthn && st.webauthn.enabled !== false) return;
+  ["setup-passkey", "login-passkey", "reg-passkey", "add-passkey", "passkey-list"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  });
+}
+
 function renderAccount(st) {
   const u = st.user || {};
   document.getElementById("account-btn").textContent = u.username || "Account";
@@ -135,6 +145,7 @@ async function waLogin(username) {
 }
 
 async function routeFromStatus(st) {
+  applyPasskeySupport(st);
   if (st.passwordBackend === "pam") {
     document.getElementById("login-lead").textContent = st.setupRequired
       ? "Sign in with your Linux account. The first user becomes admin; later users must be in group teslamate-rs."

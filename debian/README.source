@@ -1,0 +1,105 @@
+teslamate-rs source packaging notes
+===================================
+
+Build system
+------------
+This package builds with dh-cargo against Debian's packaged crates
+(librust-*-dev), not against a rustup toolchain and not by fetching from
+crates.io. The build is therefore offline and reproducible, and the
+binary gets ${cargo:Built-Using} / ${cargo:Static-Built-Using} as Policy
+requires for statically linked Rust.
+
+  sbuild -d unstable
+
+Target suite is unstable. The crate versions this package needs are not
+all in trixie.
+
+Source format (for the maintainer)
+----------------------------------
+debian/source/format is "3.0 (native)" but debian/changelog carries a
+Debian revision. dpkg-dev 1.23 warns about this ("native package version
+may not have a revision"); older dpkg-dev, including the version in
+trixie, refuses to build the source package at all. Either drop the
+revision or move to "3.0 (quilt)" with an orig tarball. Left alone here:
+it is a release decision, not a build-system one.
+
+Cargo.toml requirements vs Debian
+---------------------------------
+dh-cargo ignores Cargo.lock entirely and resolves against the installed
+librust-*-dev packages, so what matters is the semver requirement in
+Cargo.toml, not the pinned version in the lock file.
+
+Debian ships several semver generations of a crate side by side, so most
+of teslamate-rs's older pins (rand 0.8, sha2 0.10, aes-gcm 0.10,
+argon2 0.5, reqwest 0.12) resolve as-is.
+
+Three requirements needed changing, and have been changed:
+
+  rusqlite            0.32 -> 0.40, and the "bundled" feature dropped.
+                      Debian's librust-libsqlite3-sys-dev is a +ds
+                      repack with the vendored SQLite amalgamation
+                      removed, and links the system libsqlite3 instead.
+                      That is the required behaviour for a Debian
+                      package - a bundled SQLite copy would not be
+                      accepted, and would miss security updates.
+
+  tokio-tungstenite   0.26 -> 0.28. Only src/logger.rs uses it.
+
+  webauthn-rs         Not in Debian at any version, along with its
+                      dependencies webauthn-rs-core, webauthn-rs-proto,
+                      webauthn-attestation-ca, base64urlsafedata and
+                      serde_cbor_2. See "Passkeys" below.
+
+TLS trust store
+---------------
+Upstream previously selected reqwest's "rustls-tls-webpki-roots"
+feature, which compiles a snapshot of the Mozilla CA bundle into the
+binary; webpki-roots is also not in Debian. Both reqwest and
+tokio-tungstenite now use "rustls-tls-native-roots" instead, and the
+package depends on ca-certificates.
+
+Passkeys
+--------
+webauthn-rs is not packaged in Debian, so the WebAuthn code sits behind
+the "passkeys" Cargo feature. It is on by default for upstream builds;
+debian/rules passes --no-default-features, so the .deb is built without
+it. PAM and password authentication are unaffected; only passkey
+enrolment and passkey login are lost.
+
+/api/auth/status reports "webauthn": {"enabled": false} in that build,
+and web/auth.js hides the passkey controls when it sees that, so the UI
+does not offer routes that are not registered.
+
+Packaging webauthn-rs is the alternative. It needs six new source
+packages, and webauthn-rs-core pins asn1-rs 0.6 / der-parser 9 /
+x509-parser 0.16 while Debian carries 0.7 / 10 / 0.18, so it would also
+need patching to build against the newer parsers. If that lands, drop
+CARGO_ARGS from debian/rules and add the librust-webauthn-rs-0.5-dev
+build dependency.
+
+Release profile
+---------------
+[profile.release] no longer sets strip = true, so dh_strip can produce
+the teslamate-rs-dbgsym package. Do not reinstate it.
+
+Cargo.lock
+----------
+dh-cargo deletes Cargo.lock during configure and resolves against
+/usr/share/cargo/registry, so the lock file plays no part in the Debian
+build. It is stale with respect to the rusqlite and tokio-tungstenite
+bumps above and should be regenerated ("cargo update -p rusqlite -p
+tokio-tungstenite") for upstream, non-Debian builds.
+
+Build resources
+---------------
+[profile.release] in Cargo.toml asks for fat LTO with codegen-units = 1.
+Combined with the -C debuginfo=2 that Debian needs in order to produce a
+dbgsym package, linking the 169 statically linked crates peaks high
+enough to get the final rustc OOM-killed on an ordinary machine.
+
+debian/rules therefore sets DEB_BUILD_OPTIONS += optimize=+lto, which
+/usr/share/cargo/bin/cargo turns into profile.release.lto="thin". If a
+build host is still short of memory, optimize=-lto disables LTO
+entirely. Neither changes the upstream profile.
+
+ -- Richard Oliver <source@richard-oliver.co.uk>  Mon, 21 Sep 2026 09:00:00 +0100

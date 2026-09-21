@@ -1294,6 +1294,8 @@ struct Patterns {
     time_as: Regex,
     #[allow(dead_code)]
     unnest_select: Regex,
+    // rewrite_lateral() does its own brace matching; kept for symmetry.
+    #[allow(dead_code)]
     lateral: Regex,
     cast: Regex,
 }

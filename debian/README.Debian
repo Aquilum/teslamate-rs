@@ -14,6 +14,7 @@ Service
   replace it.
 
 Build
-  dpkg-buildpackage -us -uc -b -d
-  Requires rustc 1.98.1 (rust-toolchain.toml). rustup's cargo is used when
-  ~/.cargo/bin is on PATH; -d skips the apt cargo/rustc build-depends.
+  sbuild -d unstable
+  The package builds offline with dh-cargo against Debian's librust-*-dev
+  crates; no rustup toolchain and no crates.io access are needed. See
+  debian/README.source for the crate-version notes.

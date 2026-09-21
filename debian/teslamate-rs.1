@@ -1,0 +1,187 @@
+.TH TESLAMATE\-RS 1 "2026-09-21" "teslamate-rs 0.1.0" "User Commands"
+.SH NAME
+teslamate\-rs \- single-process TeslaMate with SQLite and built-in dashboards
+.SH SYNOPSIS
+.B teslamate\-rs
+.RI [ \fB\-\-db\fR " " \fIPATH\fR ]
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B teslamate\-rs
+is a RAM-saving rewrite of TeslaMate as a single Rust binary. It stores
+data in SQLite rather than PostgreSQL and serves Grafana-parity dashboards
+from its own HTTP server, so neither PostgreSQL nor Grafana is needed.
+.PP
+On Debian the daemon normally runs under systemd as
+.BR teslamate\-rs.service ,
+which invokes
+.B teslamate\-rs serve
+and is configured through
+.IR /etc/default/teslamate\-rs .
+See
+.BR README.Debian .
+.SH GLOBAL OPTIONS
+.TP
+.BI \-\-db " PATH"
+SQLite database path. Defaults to the packaged service location,
+.IR /srv/teslamate\-rs/teslamate\-rs.sqlite .
+Also settable with
+.BR TESLAMATE_RS_DB .
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH COMMANDS
+.TP
+.B serve
+Serve the dashboards, and start the Tesla Owner API logger if tokens have
+been stored. Options:
+.BI \-\-bind " ADDR"
+(default 127.0.0.1),
+.BI \-\-port " PORT"
+(default 4010),
+.B \-\-no\-logger
+to serve without polling Tesla, and
+.BI \-\-auth " BACKEND"
+where
+.I BACKEND
+is
+.B local
+(argon2 hashes in SQLite) or
+.B pam
+(Linux accounts). The default is
+.B pam
+when
+.I /etc/pam.d/teslamate\-rs
+exists, otherwise
+.BR local .
+.TP
+.B login \-\-refresh\-token \fITOKEN\fR
+Store an Owner API refresh token and register the vehicles on the account.
+.TP
+.B import
+Import a live TeslaMate PostgreSQL instance through
+.BR "docker exec" .
+Options:
+.BI \-\-docker " CONTAINER"
+(default teslamate\-database\-1),
+.BI \-\-user " USER"
+and
+.BI \-\-dbname " NAME"
+(both default teslamate).
+.TP
+.B import\-tokens
+Import Cloak-encrypted Owner API tokens from a live TeslaMate instance. Takes
+the same options as
+.BR import ,
+plus
+.BI \-\-app " CONTAINER"
+(default teslamate\-teslamate\-1).
+.TP
+.B refresh
+Perform a TeslaMate-style Owner API read sweep. Does not send
+.BR wake_up ;
+vehicle data is fetched only for vehicles already online.
+.TP
+.B sync\-invoices
+Pull Tesla Supercharger invoices through the account API. This does not wake
+the car. With
+.B \-\-full
+it forces an OAuth refresh, lists vehicles, and walks every history page.
+.TP
+.B seed
+Load synthetic drives, charges and positions. No Tesla account is needed.
+.TP
+.B demo
+Seed mock history, run a local Tesla API mock, log in against it, and serve
+the dashboards. Options:
+.BI \-\-bind " ADDR"
+(default 127.0.0.1),
+.BI \-\-port " PORT"
+(default 4010) and
+.BI \-\-mock\-port " PORT"
+(default 4070).
+.TP
+.B probe
+Contact Tesla auth, products and vehicle_data as a connectivity check. No
+token values are printed.
+.TP
+.B doctor
+Print the schema and per-table row counts.
+.SH ENVIRONMENT
+Every option below can also be set in
+.IR /etc/default/teslamate\-rs .
+.TP
+.B TESLAMATE_RS_DB
+SQLite database path.
+.TP
+.B TESLAMATE_RS_HOME
+Service data directory.
+.TP
+.B TESLAMATE_RS_BIND
+.TQ
+.B TESLAMATE_RS_PORT
+Listen address and port.
+.TP
+.B TESLAMATE_RS_AUTH
+Password backend,
+.B local
+or
+.BR pam .
+.TP
+.B TESLAMATE_RS_PAM_SERVICE
+PAM service name. Default
+.BR teslamate\-rs .
+.TP
+.B TESLAMATE_RS_PAM_GROUP
+Group a user must belong to in order to log in.
+.TP
+.B TESLAMATE_RS_PAM_ALLOW_ROOT
+Permit root to log in. Refused by default.
+.TP
+.B TESLAMATE_RS_NO_LOGGER
+Serve without starting the Owner API logger.
+.TP
+.B TESLAMATE_RS_POLL_SECS
+Owner API poll interval in seconds.
+.TP
+.B TESLAMATE_RS_NO_INVOICES
+.TQ
+.B TESLAMATE_RS_INVOICE_SECS
+Disable Supercharger invoice syncing, or set its interval in seconds.
+.TP
+.B TESLAMATE_RS_READ_POOL
+Number of read-only SQLite connections.
+.TP
+.B TESLAMATE_RS_DEVICE_COUNTRY
+Device country reported to the Tesla account API.
+.TP
+.B TESLAMATE_RS_WEBAUTHN_ORIGIN
+.TQ
+.B TESLAMATE_RS_WEBAUTHN_RP_ID
+Public origin and relying-party ID for passkeys, for use behind a reverse
+proxy. The Debian package is built without passkey support; see
+.BR README.source .
+.SH FILES
+.TP
+.I /etc/default/teslamate\-rs
+Environment for the systemd service.
+.TP
+.I /etc/pam.d/teslamate\-rs
+PAM configuration. Its presence selects the PAM backend by default.
+.TP
+.I /srv/teslamate\-rs/teslamate\-rs.sqlite
+Database, with its WAL files alongside. Not removed when the package is.
+.SH EXIT STATUS
+Zero on success, non-zero on failure.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR sqlite3 (1).
+.PP
+Packaging notes are in
+.I /usr/share/doc/teslamate\-rs/README.Debian
+and upstream documentation at
+.UR https://github.com/teslamate\-org/teslamate
+.UE .

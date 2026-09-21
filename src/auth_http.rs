@@ -3,10 +3,13 @@
 use crate::app_state::App;
 use crate::auth::{
     self, api_err, hash_password, internal_err, issue_session, normalize_username, pam_provision_user,
-    passkeys_of, session_token_from_jar, store_passkey, update_stored_passkey, verify_password,
-    AdminUser, AuthUser, OptionalUser, PasswordBackend, WA_COOKIE,
+    session_token_from_jar, verify_password, AdminUser, AuthUser, OptionalUser, PasswordBackend,
 };
-use crate::users::{self, User};
+#[cfg(feature = "passkeys")]
+use crate::auth::{passkeys_of, store_passkey, update_stored_passkey, WA_COOKIE};
+use crate::users;
+#[cfg(feature = "passkeys")]
+use crate::users::User;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post};
@@ -14,23 +17,28 @@ use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(feature = "passkeys")]
 use uuid::Uuid;
+#[cfg(feature = "passkeys")]
 use webauthn_rs::prelude::*;
 
 pub fn router() -> Router<App> {
-    Router::new()
+    let router = Router::new()
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/setup", post(auth_setup))
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/passkeys", get(list_passkeys))
+        .route("/api/auth/passkeys/{id}", delete(delete_passkey))
+        .route("/api/admin/invites", get(list_invites).post(create_invite));
+    #[cfg(feature = "passkeys")]
+    let router = router
         .route("/api/auth/webauthn/register/start", post(wa_register_start))
         .route("/api/auth/webauthn/register/finish", post(wa_register_finish))
         .route("/api/auth/webauthn/login/start", post(wa_login_start))
-        .route("/api/auth/webauthn/login/finish", post(wa_login_finish))
-        .route("/api/auth/passkeys", get(list_passkeys))
-        .route("/api/auth/passkeys/{id}", delete(delete_passkey))
-        .route("/api/admin/invites", get(list_invites).post(create_invite))
+        .route("/api/auth/webauthn/login/finish", post(wa_login_finish));
+    router
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
@@ -64,6 +72,7 @@ fn setup_conflict(err: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     }
 }
 
+#[cfg(feature = "passkeys")]
 fn request_webauthn(app: &App, headers: &HeaderMap) -> Result<Webauthn, (StatusCode, Json<Value>)> {
     app.auth.webauthn_from(headers).map_err(|_| {
         api_err(
@@ -88,6 +97,9 @@ async fn auth_status(
         "passwordBackend": app.password_backend.as_str(),
         "registerEnabled": app.password_backend == PasswordBackend::Local,
         "webauthn": {
+            // false when built without the "passkeys" feature (the Debian
+            // build): webauthn-rs is not packaged in Debian.
+            "enabled": cfg!(feature = "passkeys"),
             "rpId": app.auth.rp_id_from(&headers),
             "origin": app.auth.origin_from(&headers),
         },
@@ -234,12 +246,14 @@ async fn auth_logout(
     ))
 }
 
+#[cfg(feature = "passkeys")]
 #[derive(Deserialize)]
 struct RegisterStart {
     username: Option<String>,
     invite: Option<String>,
 }
 
+#[cfg(feature = "passkeys")]
 async fn wa_register_start(
     State(app): State<App>,
     headers: HeaderMap,
@@ -340,6 +354,7 @@ async fn wa_register_start(
     Ok((jar, Json(serde_json::to_value(ccr).map_err(internal_err)?)))
 }
 
+#[cfg(feature = "passkeys")]
 #[derive(Deserialize)]
 struct WebauthnFinish {
     credential: Value,
@@ -347,6 +362,7 @@ struct WebauthnFinish {
     invite: Option<String>,
 }
 
+#[cfg(feature = "passkeys")]
 async fn wa_register_finish(
     State(app): State<App>,
     headers: HeaderMap,
@@ -432,11 +448,13 @@ async fn wa_register_finish(
     }
 }
 
+#[cfg(feature = "passkeys")]
 #[derive(Deserialize)]
 struct LoginStart {
     username: Option<String>,
 }
 
+#[cfg(feature = "passkeys")]
 async fn wa_login_start(
     State(app): State<App>,
     headers: HeaderMap,
@@ -486,6 +504,7 @@ async fn wa_login_start(
     ))
 }
 
+#[cfg(feature = "passkeys")]
 async fn wa_login_finish(
     State(app): State<App>,
     headers: HeaderMap,
@@ -525,6 +544,7 @@ async fn wa_login_finish(
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
+#[cfg(feature = "passkeys")]
 fn apply_auth_result(
     app: &App,
     user: &User,

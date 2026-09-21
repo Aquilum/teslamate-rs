@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const SESSION_DAYS: i64 = 30;
 const INVITE_DAYS: i64 = 7;
+#[cfg(feature = "passkeys")]
 const WEBAUTHN_MINUTES: i64 = 10;
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +38,7 @@ pub struct InviteInfo {
     pub used: bool,
 }
 
+#[cfg(feature = "passkeys")]
 pub struct WebauthnChallenge {
     pub purpose: String,
     pub user_id: Option<i64>,
@@ -226,6 +228,7 @@ pub fn delete_session(conn: &Connection, token: &str) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(feature = "passkeys")]
 pub fn store_webauthn_challenge(
     conn: &Connection,
     id: &str,
@@ -255,6 +258,7 @@ pub fn store_webauthn_challenge(
     Ok(())
 }
 
+#[cfg(feature = "passkeys")]
 pub fn take_webauthn_challenge(
     conn: &Connection,
     id: &str,
@@ -287,6 +291,7 @@ pub fn take_webauthn_challenge(
     Ok(row)
 }
 
+#[cfg(feature = "passkeys")]
 pub fn insert_passkey(
     conn: &Connection,
     user_id: i64,
@@ -301,6 +306,7 @@ pub fn insert_passkey(
     Ok(conn.last_insert_rowid())
 }
 
+#[cfg(feature = "passkeys")]
 pub fn passkeys_for_user(
     conn: &Connection,
     user_id: i64,
@@ -336,6 +342,7 @@ pub fn passkey_count(conn: &Connection, user_id: i64) -> Result<i64, Box<dyn std
     )?)
 }
 
+#[cfg(feature = "passkeys")]
 pub fn update_passkey_json(
     conn: &Connection,
     user_id: i64,
