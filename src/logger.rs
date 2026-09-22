@@ -9,6 +9,21 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
+/// Strip HTML/script-friendly punctuation from Tesla display names before storage.
+pub fn sanitize_vehicle_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | '"' | '\'' | '`' | '\\'))
+        .take(64)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "Vehicle".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn poll_secs() -> u64 {
     std::env::var("TESLAMATE_RS_POLL_SECS")
         .ok()
@@ -92,7 +107,7 @@ async fn upsert_vehicles(db: &Db, mut tesla: Tesla) -> Result<()> {
         let vid = tesla::i64_field(&p, &["id"]).context("vehicle id")?;
         let eid = tesla::i64_field(&p, &["vehicle_id"]).unwrap_or(vid);
         let vin = tesla::str_field(&p, &["vin"]).unwrap_or("").to_string();
-        let name = tesla::str_field(&p, &["display_name"]).map(|s| s.to_string());
+        let name = tesla::str_field(&p, &["display_name"]).map(|s| sanitize_vehicle_name(s));
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let conn = db.lock();
         let existing: Option<i64> = conn
@@ -485,4 +500,19 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_vehicle_name;
+
+    #[test]
+    fn strips_html_metacharacters_from_vehicle_names() {
+        assert_eq!(
+            sanitize_vehicle_name(r#"</option><img src=x onerror=alert(1)>"#),
+            "/optionimg src=x onerror=alert(1)/"
+        );
+        assert_eq!(sanitize_vehicle_name("  Red S  "), "Red S");
+        assert_eq!(sanitize_vehicle_name("<<<"), "Vehicle");
+    }
 }
