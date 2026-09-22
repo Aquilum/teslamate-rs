@@ -177,7 +177,7 @@ fn apply_cookie(mut cookie: Cookie<'static>, secure: bool) -> Cookie<'static> {
     cookie.set_http_only(true);
     cookie.set_path("/");
     cookie.set_same_site(SameSite::Strict);
-    cookie.set_max_age(time::Duration::days(30));
+    cookie.set_max_age(time::Duration::days(crate::users::session_days()));
     if secure {
         cookie.set_secure(true);
     }

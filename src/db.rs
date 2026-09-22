@@ -124,6 +124,8 @@ fn open_conn(path: &Path, apply_schema: bool) -> Result<Connection> {
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     if apply_schema {
         conn.execute_batch(include_str!("../schema.sql"))?;
+        // Older DBs created sessions without last_seen.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT", []);
     }
     register_functions(&conn)?;
     Ok(conn)

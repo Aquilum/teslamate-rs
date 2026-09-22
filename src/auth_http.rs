@@ -7,13 +7,14 @@ use crate::auth::{
     AdminUser, AuthUser, OptionalUser, PasswordBackend, WA_COOKIE,
 };
 use crate::users::{self, User};
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
@@ -33,8 +34,9 @@ pub fn router() -> Router<App> {
         .route("/api/admin/invites", get(list_invites).post(create_invite))
 }
 
-fn client_ip(headers: &HeaderMap) -> String {
-    if auth::trust_proxy() {
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let peer_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
+    if auth::trust_proxy() && peer_loopback {
         if let Some(ip) = headers
             .get("x-real-ip")
             .and_then(|v| v.to_str().ok())
@@ -45,11 +47,16 @@ fn client_ip(headers: &HeaderMap) -> String {
             return ip.to_string();
         }
     }
-    "local".to_string()
+    peer.map(|p| p.ip().to_string())
+        .unwrap_or_else(|| "local".to_string())
 }
 
-fn rate_limit(app: &App, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
-    if app.limiter.allow(&client_ip(headers)) {
+fn rate_limit(
+    app: &App,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if app.limiter.allow(&client_ip(headers, peer)) {
         Ok(())
     } else {
         Err(api_err(
@@ -121,11 +128,12 @@ struct UsernamePassword {
 
 async fn auth_setup(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     if !app.setup_allowed {
         return Err(api_err(
             StatusCode::FORBIDDEN,
@@ -160,11 +168,12 @@ async fn auth_setup(
 
 async fn auth_register(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     if app.password_backend == PasswordBackend::Pam {
         return Err(api_err(
             StatusCode::BAD_REQUEST,
@@ -204,11 +213,12 @@ async fn auth_register(
 
 async fn auth_login(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     let username = normalize_username(&body.username).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
     let password = body.password.unwrap_or_default();
     if app.password_backend == PasswordBackend::Pam {
@@ -261,13 +271,14 @@ struct RegisterStart {
 
 async fn wa_register_start(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     user: OptionalUser,
     Json(body): Json<RegisterStart>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
     if user.0.is_none() {
-        rate_limit(&app, &headers)?;
+        rate_limit(&app, &headers, Some(peer))?;
     }
     let exclude: Option<Vec<CredentialID>> = None;
     let (purpose, user_id, username, invite_hash, uuid, display) = if let Some(user) = user.0 {
@@ -482,11 +493,12 @@ struct LoginStart {
 
 async fn wa_login_start(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<LoginStart>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     let failed = || api_err(StatusCode::UNAUTHORIZED, "passkey sign-in failed");
     let raw = body
         .username
@@ -531,11 +543,12 @@ async fn wa_login_start(
 
 async fn wa_login_finish(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<WebauthnFinish>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     let challenge_id = jar
         .get(WA_COOKIE)
         .map(|c| c.value().to_string())

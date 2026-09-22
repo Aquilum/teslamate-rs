@@ -3,6 +3,7 @@ mod audit;
 mod auth;
 mod auth_http;
 mod db;
+mod docker_util;
 mod import;
 mod invoices;
 mod logger;
@@ -106,6 +107,7 @@ fn point_at_mock(bind: &str, mock_port: u16) {
     std::env::set_var("TESLA_AUTH_URL", format!("{base}/oauth2/v3/token"));
     std::env::set_var("TESLA_WSS_HOST", format!("ws://{bind}:{mock_port}/streaming/"));
     std::env::set_var("TESLAMATE_RS_POLL_SECS", "1");
+    std::env::set_var("TESLAMATE_RS_ALLOW_INSECURE_TESLA", "1");
 }
 
 async fn probe(db: &db::Db) -> Result<()> {

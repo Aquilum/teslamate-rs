@@ -122,13 +122,74 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         .route("/api/dbinfo", get(dbinfo))
         .merge(crate::auth_http::router())
         .route("/{*path}", get(static_file))
+        .layer(middleware::from_fn(csrf_guard))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
     tracing::info!("teslamate-rs listening on http://{bind}");
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+async fn csrf_guard(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let mutating = matches!(
+        method.as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    );
+    if mutating {
+        let has_session = req
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.contains(crate::auth::SESSION_COOKIE));
+        if has_session && !csrf_origin_ok(req.headers()) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "cross-origin request blocked" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn csrf_origin_ok(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        if site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none") {
+            return true;
+        }
+        if site.eq_ignore_ascii_case("cross-site") {
+            return false;
+        }
+    }
+    let expected = crate::auth::public_origin(headers, "");
+    if expected.is_empty() {
+        return true;
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        return origin_matches(origin, &expected);
+    }
+    if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+        return referer.starts_with(&expected);
+    }
+    // Browser fetch to same origin usually sends Origin; allow missing for non-browser clients on loopback-style Host.
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| h.starts_with("127.0.0.1") || h.starts_with("localhost"))
+}
+
+fn origin_matches(origin: &str, expected: &str) -> bool {
+    origin.trim_end_matches('/') == expected.trim_end_matches('/')
 }
 
 async fn security_headers(req: Request, next: Next) -> Response {
@@ -461,11 +522,8 @@ fn execute_dashboard_query(
             return cancelled_json();
         }
         Err(e) => {
-            return json!({
-                "ok": false,
-                "error": e.to_string(),
-                "sql": translated,
-            });
+            tracing::warn!("query prepare failed: {e}; sql={}", preview_sql_log(&translated));
+            return json!({ "ok": false, "error": "query failed" });
         }
     };
     let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
@@ -476,20 +534,21 @@ fn execute_dashboard_query(
             return cancelled_json();
         }
         Err(e) => {
-            return json!({
-                "ok": false,
-                "error": e.to_string(),
-                "sql": translated,
-            });
+            tracing::warn!("query start failed: {e}; sql={}", preview_sql_log(&translated));
+            return json!({ "ok": false, "error": "query failed" });
         }
     };
     let mut truncated = false;
     loop {
         if Instant::now() >= deadline {
+            tracing::warn!(
+                "query timed out after {}ms; sql={}",
+                query_timeout().as_millis(),
+                preview_sql_log(&translated)
+            );
             return json!({
                 "ok": false,
                 "error": format!("query timed out after {}ms", query_timeout().as_millis()),
-                "sql": translated,
             });
         }
         match mapped.next() {
@@ -506,11 +565,8 @@ fn execute_dashboard_query(
                         }
                         Err(e) if is_interrupt(&e) => return cancelled_json(),
                         Err(e) => {
-                            return json!({
-                                "ok": false,
-                                "error": e.to_string(),
-                                "sql": translated,
-                            });
+                            tracing::warn!("query row failed: {e}");
+                            return json!({ "ok": false, "error": "query failed" });
                         }
                     }
                 }
@@ -521,11 +577,8 @@ fn execute_dashboard_query(
                 return cancelled_json();
             }
             Err(e) => {
-                return json!({
-                    "ok": false,
-                    "error": e.to_string(),
-                    "sql": translated,
-                });
+                tracing::warn!("query iterate failed: {e}");
+                return json!({ "ok": false, "error": "query failed" });
             }
         }
     }
@@ -540,7 +593,6 @@ fn execute_dashboard_query(
         "ok": true,
         "columns": names,
         "rows": rows,
-        "sql": translated,
         "truncated": truncated,
         "maxRows": max_rows,
     });
@@ -551,6 +603,10 @@ fn execute_dashboard_query(
         cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
     }
     payload
+}
+
+fn preview_sql_log(sql: &str) -> String {
+    sql.chars().take(160).collect::<String>().replace('\n', " ")
 }
 
 async fn run_query(
@@ -627,9 +683,10 @@ impl From<anyhow::Error> for AppError {
 }
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        tracing::error!("teslamate-rs api: {:#}", self.0);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "ok": false, "error": self.0.to_string() })),
+            Json(json!({ "ok": false, "error": "internal error" })),
         )
             .into_response()
     }

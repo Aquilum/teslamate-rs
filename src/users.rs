@@ -6,7 +6,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const SESSION_DAYS: i64 = 30;
 const INVITE_DAYS: i64 = 7;
 const WEBAUTHN_MINUTES: i64 = 10;
 
@@ -186,16 +185,37 @@ pub fn insert_user_with_invite(
     })
 }
 
+const SESSION_DAYS_DEFAULT: i64 = 7;
+const SESSION_IDLE_HOURS_DEFAULT: i64 = 24;
+
+pub fn session_days() -> i64 {
+    std::env::var("TESLAMATE_RS_SESSION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_DAYS_DEFAULT)
+        .clamp(1, 90)
+}
+
+pub fn session_idle_hours() -> i64 {
+    std::env::var("TESLAMATE_RS_SESSION_IDLE_HOURS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_IDLE_HOURS_DEFAULT)
+        .clamp(1, 24 * 30)
+}
+
 pub fn create_session(
     conn: &Connection,
     user_id: i64,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expires = (Utc::now() + Duration::days(SESSION_DAYS)).to_rfc3339();
+    let now = Utc::now();
+    let expires = (now + Duration::days(session_days())).to_rfc3339();
+    let seen = now.to_rfc3339();
     conn.execute(
-        "INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
-         VALUES (?1, ?2, ?3, datetime('now'))",
-        params![hash_secret(token), user_id, expires],
+        "INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_seen)
+         VALUES (?1, ?2, ?3, datetime('now'), ?4)",
+        params![hash_secret(token), user_id, expires, seen],
     )?;
     Ok(())
 }
@@ -205,17 +225,35 @@ pub fn user_from_session(
     token: &str,
 ) -> Result<Option<User>, Box<dyn std::error::Error>> {
     let hash = hash_secret(token);
-    let now = Utc::now().to_rfc3339();
-    conn.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now])?;
-    Ok(conn
+    let now = Utc::now();
+    let now_s = now.to_rfc3339();
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now_s])?;
+    let idle_cut = (now - Duration::hours(session_idle_hours())).to_rfc3339();
+    conn.execute(
+        "DELETE FROM sessions WHERE last_seen IS NOT NULL AND last_seen < ?1",
+        [&idle_cut],
+    )?;
+    // Legacy rows without last_seen: treat created_at as last_seen for idle.
+    conn.execute(
+        "DELETE FROM sessions WHERE last_seen IS NULL AND created_at < ?1",
+        [&idle_cut],
+    )?;
+    let user = conn
         .query_row(
             "SELECT u.id, u.uuid, u.username, u.password_hash, u.is_admin
              FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_hash=?1 AND s.expires_at >= ?2",
-            params![hash, now],
+            params![hash, now_s],
             map_user,
         )
-        .optional()?)
+        .optional()?;
+    if user.is_some() {
+        conn.execute(
+            "UPDATE sessions SET last_seen=?1 WHERE token_hash=?2",
+            params![now_s, hash],
+        )?;
+    }
+    Ok(user)
 }
 
 pub fn delete_session(conn: &Connection, token: &str) -> Result<(), Box<dyn std::error::Error>> {
