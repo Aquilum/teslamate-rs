@@ -1,5 +1,5 @@
 use crate::app_state::{App, AuthLimiter, QueryCache};
-use crate::auth::{AuthState, AuthUser, PasswordBackend};
+use crate::auth::{AdminUser, AuthState, AuthUser, PasswordBackend};
 use crate::db::Db;
 use crate::sql::{self, QueryVars};
 use anyhow::Result;
@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower_http::trace::TraceLayer;
 
 #[derive(RustEmbed)]
@@ -28,6 +28,39 @@ struct Web;
 #[derive(RustEmbed)]
 #[folder = "dashboards/"]
 struct Dashboards;
+
+const DEFAULT_QUERY_MAX_ROWS: usize = 50_000;
+const DEFAULT_QUERY_TIMEOUT_MS: u64 = 15_000;
+
+fn query_max_rows() -> usize {
+    std::env::var("TESLAMATE_RS_QUERY_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_MAX_ROWS)
+        .clamp(100, 500_000)
+}
+
+fn query_timeout() -> Duration {
+    let ms = std::env::var("TESLAMATE_RS_QUERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS)
+        .clamp(500, 120_000);
+    Duration::from_millis(ms)
+}
+
+pub fn setup_allowed_for_bind(bind: SocketAddr) -> bool {
+    if bind.ip().is_loopback() {
+        return true;
+    }
+    matches!(
+        std::env::var("TESLAMATE_RS_ALLOW_SETUP")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) -> Result<()> {
     let origin = if bind.ip().is_loopback() {
@@ -60,12 +93,23 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         }
         PasswordBackend::Local => tracing::info!("password backend: local (SQLite argon2)"),
     }
+    let setup_allowed = setup_allowed_for_bind(bind);
+    if !setup_allowed {
+        tracing::info!(
+            "first-admin setup locked (non-loopback bind); set TESLAMATE_RS_ALLOW_SETUP=1 to unlock"
+        );
+    }
+    tracing::info!(
+        "dashboard SQL allowlist: {} templates",
+        crate::query_allowlist::len()
+    );
     let state = App {
         db,
         auth,
         password_backend,
         limiter: AuthLimiter::default(),
         query_cache: QueryCache::default(),
+        setup_allowed,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -338,9 +382,24 @@ fn execute_dashboard_query(
     sql: String,
     mut vars: QueryVars,
     cancelled: &Arc<AtomicBool>,
+    enforce_allowlist: bool,
+    actor: Option<String>,
 ) -> Value {
     if cancelled.load(Ordering::Relaxed) {
         return cancelled_json();
+    }
+    if enforce_allowlist && !crate::query_allowlist::is_allowed(&sql) {
+        let preview: String = sql.chars().take(120).collect();
+        crate::audit::record(
+            db,
+            actor.as_deref(),
+            "query_denied",
+            &format!("not in dashboard allowlist: {preview}"),
+        );
+        return json!({
+            "ok": false,
+            "error": "query is not an allowed dashboard template",
+        });
     }
     if let Some(payload) = query_stats_override(&sql, cache) {
         return payload;
@@ -365,6 +424,12 @@ fn execute_dashboard_query(
     }))
     .unwrap_or_else(|_| sql.clone());
     if let Err(msg) = sql::assert_safe_dashboard_sql(&translated) {
+        crate::audit::record(
+            db,
+            actor.as_deref(),
+            "query_blocked",
+            &msg,
+        );
         return json!({
             "ok": false,
             "error": msg,
@@ -372,6 +437,8 @@ fn execute_dashboard_query(
     }
     let key = cache_key(&translated);
     let t0 = Instant::now();
+    let deadline = t0 + query_timeout();
+    let max_rows = query_max_rows();
     if let Some(hit) = cache.get(key) {
         cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
         return hit;
@@ -384,7 +451,9 @@ fn execute_dashboard_query(
         return cancelled_json();
     }
     let flag = cancelled.clone();
-    conn.progress_handler(250, Some(move || flag.load(Ordering::Relaxed)));
+    conn.progress_handler(250, Some(move || {
+        flag.load(Ordering::Relaxed) || Instant::now() >= deadline
+    }));
     let _clear = ClearProgress(&conn);
     let mut stmt = match conn.prepare(&translated) {
         Ok(s) => s,
@@ -414,9 +483,21 @@ fn execute_dashboard_query(
             });
         }
     };
+    let mut truncated = false;
     loop {
+        if Instant::now() >= deadline {
+            return json!({
+                "ok": false,
+                "error": format!("query timed out after {}ms", query_timeout().as_millis()),
+                "sql": translated,
+            });
+        }
         match mapped.next() {
             Ok(Some(row)) => {
+                if rows.len() >= max_rows {
+                    truncated = true;
+                    break;
+                }
                 let mut obj = serde_json::Map::new();
                 for (i, name) in names.iter().enumerate() {
                     match row.get_ref(i) {
@@ -460,14 +541,20 @@ fn execute_dashboard_query(
         "columns": names,
         "rows": rows,
         "sql": translated,
+        "truncated": truncated,
+        "maxRows": max_rows,
     });
-    cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
-    cache.put(key, payload.clone());
+    if !truncated {
+        cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
+        cache.put(key, payload.clone());
+    } else {
+        cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
+    }
     payload
 }
 
 async fn run_query(
-    _user: AuthUser,
+    user: AuthUser,
     State(app): State<App>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, AppError> {
@@ -478,8 +565,9 @@ async fn run_query(
     let sql = body.sql;
     let vars = body.vars;
     let flag = cancelled.clone();
+    let actor = Some(user.username.clone());
     let payload = tokio::task::spawn_blocking(move || {
-        execute_dashboard_query(&db, &cache, sql, vars, &flag)
+        execute_dashboard_query(&db, &cache, sql, vars, &flag, true, actor)
     })
     .await
     .map_err(|e| AppError(anyhow::anyhow!("query task: {e}")))?;
@@ -496,7 +584,7 @@ fn sqlite_to_json(v: ValueRef) -> Value {
     }
 }
 
-async fn dbinfo(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
+async fn dbinfo(_admin: AdminUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
     spawn_db(app.db.clone(), |conn| {
         let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
         let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
@@ -565,6 +653,8 @@ mod query_cancel_tests {
             "select 1 as n".into(),
             vars(),
             &cancelled,
+            false,
+            None,
         );
         assert_eq!(v["cancelled"], json!(true));
     }
@@ -574,10 +664,26 @@ mod query_cancel_tests {
         let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
         let cache = QueryCache::default();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let v = execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
+        let v = execute_dashboard_query(
+            &db,
+            &cache,
+            "select 1 as n".into(),
+            vars(),
+            &cancelled,
+            false,
+            None,
+        );
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["rows"][0]["n"], json!(1));
-        let again = execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
+        let again = execute_dashboard_query(
+            &db,
+            &cache,
+            "select 1 as n".into(),
+            vars(),
+            &cancelled,
+            false,
+            None,
+        );
         assert_eq!(again["ok"], json!(true));
     }
 
@@ -595,12 +701,61 @@ mod query_cancel_tests {
             "SELECT access_token, refresh_token FROM oauth_tokens".into(),
             vars(),
             &cancelled,
+            false,
+            Some("admin".into()),
         );
         assert_eq!(v["ok"], json!(false));
         assert!(
             v["error"].as_str().unwrap_or("").contains("oauth_tokens"),
             "{v}"
         );
+    }
+
+    #[test]
+    fn query_rejects_unlisted_sql_when_allowlist_on() {
+        let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let v = execute_dashboard_query(
+            &db,
+            &QueryCache::default(),
+            "select 1 as n".into(),
+            vars(),
+            &cancelled,
+            true,
+            Some("guest".into()),
+        );
+        assert_eq!(v["ok"], json!(false));
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("allowed dashboard"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn query_allows_preview_track_template() {
+        let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let v = execute_dashboard_query(
+            &db,
+            &QueryCache::default(),
+            crate::query_allowlist::PREVIEW_TRACK_SQL.into(),
+            vars(),
+            &cancelled,
+            true,
+            Some("admin".into()),
+        );
+        assert_eq!(v["ok"], json!(true), "{v}");
     }
 }
 

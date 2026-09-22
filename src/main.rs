@@ -1,4 +1,5 @@
 mod app_state;
+mod audit;
 mod auth;
 mod auth_http;
 mod db;
@@ -7,6 +8,7 @@ mod invoices;
 mod logger;
 mod mock;
 mod pam_auth;
+mod query_allowlist;
 mod refresh;
 mod seed;
 mod server;

@@ -11,6 +11,11 @@
 # TESLAMATE_RS_WEBAUTHN_RP_ID=tm.example.com
 # Required when nginx sets X-Forwarded-* (also implied if WEBAUTHN_ORIGIN is set):
 # TESLAMATE_RS_TRUST_PROXY=1
+# Unlock first-admin setup when not bound to loopback:
+# TESLAMATE_RS_ALLOW_SETUP=1
 # Optional 64-hex-char key for encrypting Owner API tokens at rest (otherwise
-# $TESLAMATE_RS_HOME/oauth.key is created automatically):
+# /etc/teslamate-rs/oauth.key or $TESLAMATE_RS_HOME/secrets/oauth.key):
 # TESLAMATE_RS_TOKEN_KEY=
+# TESLAMATE_RS_TOKEN_KEY_FILE=/etc/teslamate-rs/oauth.key
+# TESLAMATE_RS_QUERY_MAX_ROWS=50000
+# TESLAMATE_RS_QUERY_TIMEOUT_MS=15000

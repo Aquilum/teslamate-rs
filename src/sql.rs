@@ -116,6 +116,7 @@ pub const FORBIDDEN_QUERY_TABLES: &[&str] = &[
     "invites",
     "webauthn_credentials",
     "webauthn_challenges",
+    "audit_log",
 ];
 
 /// Clamp client-controlled Grafana vars to values that are safe to splice into SQL.

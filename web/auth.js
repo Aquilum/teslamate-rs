@@ -141,6 +141,15 @@ async function routeFromStatus(st) {
       : "Sign in with your Linux username and password.";
   }
   if (st.setupRequired && st.passwordBackend !== "pam") {
+    if (st.setupAllowed === false) {
+      showGate("login");
+      const lead = document.getElementById("login-lead");
+      if (lead) {
+        lead.textContent =
+          "First-admin setup is locked on this bind. Use loopback or set TESLAMATE_RS_ALLOW_SETUP=1.";
+      }
+      return false;
+    }
     showGate("setup");
     return false;
   }

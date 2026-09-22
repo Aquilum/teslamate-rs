@@ -201,6 +201,8 @@ pub struct App {
     pub password_backend: PasswordBackend,
     pub limiter: AuthLimiter,
     pub query_cache: QueryCache,
+    /// First-admin setup is allowed (loopback bind or TESLAMATE_RS_ALLOW_SETUP=1).
+    pub setup_allowed: bool,
 }
 
 impl HasAuthDb for App {

@@ -88,6 +88,7 @@ async fn auth_status(
     };
     let mut body = json!({
         "setupRequired": setup_required,
+        "setupAllowed": app.setup_allowed,
         "authenticated": user.0.is_some(),
         "passwordBackend": app.password_backend.as_str(),
         "registerEnabled": app.password_backend == PasswordBackend::Local,
@@ -125,6 +126,12 @@ async fn auth_setup(
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
     rate_limit(&app, &headers)?;
+    if !app.setup_allowed {
+        return Err(api_err(
+            StatusCode::FORBIDDEN,
+            "first-admin setup is locked; bind to loopback or set TESLAMATE_RS_ALLOW_SETUP=1",
+        ));
+    }
     {
         let conn = app.db.lock();
         if !users::setup_required(&conn).map_err(internal_err)? {
@@ -136,6 +143,7 @@ async fn auth_setup(
         let password = body.password.unwrap_or_default();
         let user = pam_provision_user(&app.db, &username, &password).await?;
         let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+        crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (pam)");
         return Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))));
     }
     let username = normalize_username(&body.username).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
@@ -146,6 +154,7 @@ async fn auth_setup(
         users::create_first_admin(&conn, &username, Some(&hash), None).map_err(setup_conflict)?
     };
     let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (local)");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
@@ -189,6 +198,7 @@ async fn auth_register(
         })?
     };
     let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "register", "invite redeemed");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
@@ -204,6 +214,7 @@ async fn auth_login(
     if app.password_backend == PasswordBackend::Pam {
         let user = pam_provision_user(&app.db, &username, &password).await?;
         let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+        crate::audit::record(&app.db, Some(&user.username), "login", "pam");
         return Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))));
     }
     let user = {
@@ -211,15 +222,19 @@ async fn auth_login(
         users::get_user_by_username(&conn, &username).map_err(internal_err)?
     };
     let Some(user) = user else {
+        crate::audit::record(&app.db, Some(&username), "login_failed", "unknown user");
         return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
     };
     let Some(hash) = user.password_hash.as_deref() else {
+        crate::audit::record(&app.db, Some(&username), "login_failed", "no password");
         return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
     };
     if !verify_password(&password, hash) {
+        crate::audit::record(&app.db, Some(&username), "login_failed", "bad password");
         return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
     }
     let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "login", "local");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
@@ -269,6 +284,12 @@ async fn wa_register_start(
         let conn = app.db.lock();
         users::setup_required(&conn).map_err(internal_err)?
     } {
+        if !app.setup_allowed {
+            return Err(api_err(
+                StatusCode::FORBIDDEN,
+                "first-admin setup is locked; bind to loopback or set TESLAMATE_RS_ALLOW_SETUP=1",
+            ));
+        }
         if app.password_backend == PasswordBackend::Pam {
             return Err(api_err(
                 StatusCode::BAD_REQUEST,
@@ -394,6 +415,12 @@ async fn wa_register_finish(
             Ok((jar, Json(json!({ "ok": true }))))
         }
         "setup" => {
+            if !app.setup_allowed {
+                return Err(api_err(
+                    StatusCode::FORBIDDEN,
+                    "first-admin setup is locked; bind to loopback or set TESLAMATE_RS_ALLOW_SETUP=1",
+                ));
+            }
             {
                 let conn = app.db.lock();
                 if !users::setup_required(&conn).map_err(internal_err)? {
@@ -410,6 +437,7 @@ async fn wa_register_finish(
             };
             store_passkey(&app.db, user.id, &passkey).map_err(internal_err)?;
             jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+            crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (passkey)");
             Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
         }
         "register" => {
@@ -437,6 +465,7 @@ async fn wa_register_finish(
             };
             store_passkey(&app.db, user.id, &passkey).map_err(internal_err)?;
             jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+            crate::audit::record(&app.db, Some(&user.username), "register", "invite redeemed (passkey)");
             Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
         }
         other => Err(api_err(
@@ -536,6 +565,7 @@ async fn wa_login_finish(
 
     let jar = jar.remove(app.auth.wa_cookie_key(&headers));
     let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "login", "passkey");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
@@ -607,6 +637,12 @@ async fn create_invite(
         let conn = app.db.lock();
         users::create_invite(&conn, admin.id, &token).map_err(internal_err)?
     };
+    crate::audit::record(
+        &app.db,
+        Some(&admin.username),
+        "invite_create",
+        &format!("id={}", info.id),
+    );
     Ok(Json(json!({
         "id": info.id,
         "token": token,

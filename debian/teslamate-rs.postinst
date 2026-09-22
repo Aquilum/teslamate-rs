@@ -21,6 +21,13 @@ if [ "$1" = configure ]; then
 	if [ -d /srv/teslamate-rs ]; then
 		chown teslamate-rs:teslamate-rs /srv/teslamate-rs
 		chmod 750 /srv/teslamate-rs
+		mkdir -p /srv/teslamate-rs/secrets
+		chown teslamate-rs:teslamate-rs /srv/teslamate-rs/secrets
+		chmod 700 /srv/teslamate-rs/secrets
+	fi
+	if [ -d /etc/teslamate-rs ]; then
+		chown root:teslamate-rs /etc/teslamate-rs
+		chmod 750 /etc/teslamate-rs
 	fi
 fi
 

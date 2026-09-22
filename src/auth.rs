@@ -103,7 +103,8 @@ pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
             return forced.trim_end_matches('/').to_string();
         }
     }
-    let host = if trust_proxy() {
+    let trust = trust_proxy();
+    let host = if trust {
         headers
             .get("x-forwarded-host")
             .or_else(|| headers.get(header::HOST))
@@ -119,7 +120,7 @@ pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     };
-    let proto = if trust_proxy() {
+    let proto = if trust {
         headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
@@ -486,6 +487,9 @@ pub fn user_can_drop_passkey(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn password_hash_roundtrip() {
@@ -506,6 +510,7 @@ mod tests {
 
     #[test]
     fn origin_follows_nginx_forwarded_https() {
+        let _g = ENV_LOCK.lock().unwrap();
         let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
         let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
         std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
@@ -531,6 +536,7 @@ mod tests {
 
     #[test]
     fn forwarded_headers_ignored_without_trust_proxy() {
+        let _g = ENV_LOCK.lock().unwrap();
         let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
         let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
         std::env::remove_var("TESLAMATE_RS_TRUST_PROXY");
@@ -555,6 +561,9 @@ mod tests {
 
     #[test]
     fn origin_header_is_ignored() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         headers.insert(header::HOST, "mate.lan".parse().unwrap());
@@ -562,6 +571,10 @@ mod tests {
             public_origin(&headers, "http://localhost:4010"),
             "http://mate.lan"
         );
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
     }
 
     #[test]

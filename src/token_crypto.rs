@@ -2,7 +2,10 @@
 //!
 //! Key sources (first match wins):
 //! 1. `TESLAMATE_RS_TOKEN_KEY` — 64 hex chars (32 bytes) or raw 32-byte string
-//! 2. `$TESLAMATE_RS_HOME/oauth.key` — created on first use with mode 0600
+//! 2. `TESLAMATE_RS_TOKEN_KEY_FILE` — path to a 32-byte key file
+//! 3. `/etc/teslamate-rs/oauth.key` if present
+//! 4. `$TESLAMATE_RS_HOME/secrets/oauth.key` (created on first use; legacy
+//!    `$TESLAMATE_RS_HOME/oauth.key` is relocated here when found)
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -27,7 +30,56 @@ pub fn is_encrypted(value: &str) -> bool {
 }
 
 fn key_path() -> PathBuf {
-    crate::db::default_home().join("oauth.key")
+    if let Ok(p) = std::env::var("TESLAMATE_RS_TOKEN_KEY_FILE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    // Prefer a path outside the default DB directory when possible.
+    let etc = PathBuf::from("/etc/teslamate-rs/oauth.key");
+    if etc.exists() {
+        return etc;
+    }
+    let secrets = crate::db::default_home().join("secrets").join("oauth.key");
+    if secrets.exists() {
+        return secrets;
+    }
+    // Migrate legacy key that lived next to the SQLite file.
+    let legacy = crate::db::default_home().join("oauth.key");
+    if legacy.exists() && !secrets.exists() {
+        if let Some(parent) = secrets.parent() {
+            let _ = fs::create_dir_all(parent);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+        }
+        if fs::rename(&legacy, &secrets).is_ok() {
+            tracing::info!(
+                "moved Owner API token key from {} to {}",
+                legacy.display(),
+                secrets.display()
+            );
+            return secrets;
+        }
+        if fs::copy(&legacy, &secrets).is_ok() {
+            let _ = fs::remove_file(&legacy);
+            tracing::info!(
+                "copied Owner API token key from {} to {}",
+                legacy.display(),
+                secrets.display()
+            );
+            return secrets;
+        }
+        tracing::warn!(
+            "could not relocate {}; using it in place (prefer TESLAMATE_RS_TOKEN_KEY_FILE)",
+            legacy.display()
+        );
+        return legacy;
+    }
+    secrets
 }
 
 fn parse_env_key(raw: &str) -> Result<[u8; KEY_LEN]> {
@@ -58,6 +110,11 @@ fn load_or_create_file_key(path: &Path) -> Result<[u8; KEY_LEN]> {
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     let mut key = [0u8; KEY_LEN];
     OsRng.fill_bytes(&mut key);
