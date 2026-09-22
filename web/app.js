@@ -1959,7 +1959,7 @@ function climateLine(c, temp) {
   if (c.setpoint != null) bits.push(`Set ${n1(c.setpoint)}°${temp}`);
   const set = Number(c.setpoint);
   const pass = Number(c.passenger);
-  if (Number.isFinite(pass) && (!Number.isFinite(set) || Math.abs(pass - set) >= 0.5)) {
+  if (c.passenger != null && Number.isFinite(pass) && (!Number.isFinite(set) || Math.abs(pass - set) >= 0.5)) {
     bits.push(`Passenger ${n1(pass)}°${temp}`);
   }
   if (c.defrostFront || c.defrostRear) bits.push("defrost");
@@ -1967,10 +1967,7 @@ function climateLine(c, temp) {
 }
 
 function paintLive(host, data) {
-  if (host._map) {
-    host._map.remove();
-    host._map = null;
-  }
+  dropMaps(host);
   const car = data.car || {};
   const b = data.battery || {};
   const d = data.drive || {};
@@ -2092,7 +2089,6 @@ function paintLive(host, data) {
       maxZoom: 19,
     }).addTo(map);
     L.circleMarker([lat, lon], { radius: 8, color: "#e85d04", fillOpacity: 0.85, weight: 1 }).addTo(map);
-    host._map = map;
     mapEl._map = map;
     requestAnimationFrame(() => map.invalidateSize());
   } else if (mapEl) {
@@ -2116,11 +2112,17 @@ let storyGen = 0;
 
 function dropMaps(root) {
   if (!root) return;
+  const seen = new Set();
   const nodes = [root, ...root.querySelectorAll("*")];
   for (const el of nodes) {
-    if (el._map) {
-      el._map.remove();
-      el._map = null;
+    const map = el._map;
+    el._map = null;
+    if (!map || seen.has(map)) continue;
+    seen.add(map);
+    try {
+      map.remove();
+    } catch {
+      /* already torn down */
     }
   }
 }
@@ -2134,9 +2136,12 @@ function storyWhen(s) {
 
 function storyLine(data, kind) {
   if (kind === "charge") {
-    const power = (data.curve || []).map((p) => p.power);
-    if (power.filter((n) => Number.isFinite(Number(n))).length >= 2) return { values: power, label: "Charger power" };
-    return { values: (data.curve || []).map((p) => p.soc), label: "State of charge" };
+    const power = (data.curve || []).map((p) => Number(p.power)).filter(Number.isFinite);
+    const soc = (data.curve || []).map((p) => p.soc);
+    if (power.length >= 2 && Math.max(...power) - Math.min(...power) > 1) return { values: power, label: "Charger power" };
+    const finite = soc.map(Number).filter(Number.isFinite);
+    if (finite.length >= 2 && Math.max(...finite) - Math.min(...finite) >= 1) return { values: soc, label: "State of charge" };
+    return null;
   }
   const soc = data.soc || [];
   const finite = soc.map(Number).filter(Number.isFinite);
@@ -2177,17 +2182,24 @@ function mountPath(el, path) {
   }
   const map = L.map(el, { zoomControl: false, attributionControl: false });
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+  let line = null;
   if (pts.length === 1) {
-    map.setView(pts[0], 14);
     L.circleMarker(pts[0], { radius: 7, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 0.9, weight: 1 }).addTo(map);
   } else {
-    const line = L.polyline(pts, { color: "#e85d04", weight: 3, opacity: 0.95 }).addTo(map);
-    map.fitBounds(line.getBounds(), { padding: [18, 18] });
+    line = L.polyline(pts, { color: "#e85d04", weight: 3, opacity: 0.95 }).addTo(map);
     L.circleMarker(pts[0], { radius: 4, color: "#d8dde8", fillColor: "#d8dde8", fillOpacity: 1, weight: 0 }).addTo(map);
     L.circleMarker(pts[pts.length - 1], { radius: 6, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 1, weight: 0 }).addTo(map);
   }
+  const fit = () => {
+    if (line) map.fitBounds(line.getBounds(), { padding: [18, 18] });
+    else map.setView(pts[0], 14);
+  };
   el._map = map;
-  requestAnimationFrame(() => map.invalidateSize());
+  fit();
+  requestAnimationFrame(() => {
+    map.invalidateSize();
+    fit();
+  });
 }
 
 function paintStory(card, kind, data) {

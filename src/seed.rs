@@ -363,7 +363,7 @@ fn seed_charge(
 ) -> Result<()> {
     let minutes = if dc { 28 } else { 180 };
     let start = format!("{date} {start_tod}");
-    let end = format!("{date} {}", add_minutes(start_tod, minutes));
+    let end = date_time_plus(date, start_tod, minutes);
     let lat = if dc { 51.4700 } else { 51.5074 };
     let lon = if dc { -0.4543 } else { -0.1278 };
     let energy = (end_soc - start_soc) as f64 * 0.95;
@@ -403,10 +403,7 @@ fn seed_charge(
         let t = i as f64 / ticks as f64;
         let soc = start_soc as f64 + (end_soc - start_soc) as f64 * t;
         let added = energy * t;
-        let ts = format!(
-            "{date} {}",
-            add_minutes(start_tod, (minutes * i as i64) / ticks as i64)
-        );
+        let ts = date_time_plus(date, start_tod, (minutes * i as i64) / ticks as i64);
         conn.execute(
             "INSERT INTO charges (id, date, battery_level, charge_energy_added, charger_actual_current,
                 charger_phases, charger_pilot_current, charger_power, charger_voltage, fast_charger_present,
@@ -435,6 +432,18 @@ fn seed_charge(
     }
     *charge_id += 1;
     Ok(())
+}
+
+/// Clock time plus minutes, carrying the calendar day when a charge passes midnight.
+fn date_time_plus(date: &str, hms: &str, minutes: i64) -> String {
+    let parts: Vec<i64> = hms.split(':').filter_map(|s| s.parse().ok()).collect();
+    let base = parts.first().copied().unwrap_or(0) * 60 + parts.get(1).copied().unwrap_or(0);
+    let total = base + minutes;
+    let day = total.div_euclid(24 * 60);
+    let mins = total.rem_euclid(24 * 60);
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap_or_default()
+        + chrono::Duration::days(day);
+    format!("{} {:02}:{:02}:00", d.format("%Y-%m-%d"), mins / 60, mins % 60)
 }
 
 fn add_minutes(hms: &str, minutes: i64) -> String {

@@ -387,7 +387,13 @@ fn wh_per_unit(
     if dist <= 0.0 {
         return None;
     }
-    Some(live::round1(delta * eff * 1000.0 / dist))
+    let wh = live::round1(delta * eff * 1000.0 / dist);
+    // A rated-range jump far out of scale with the distance is a recalibration,
+    // not the cost of the trip. Leave it off the story.
+    if !(40.0..=1200.0).contains(&wh) {
+        return None;
+    }
+    Some(wh)
 }
 
 fn downsample<T>(pts: Vec<T>, max: usize) -> Vec<T> {
@@ -487,6 +493,7 @@ mod tests {
         assert!(view["elevation"][0].as_f64().unwrap() > 60.0);
         assert!(drive_detail(&conn, 1, 99).unwrap().is_none());
         assert!(drive_detail(&conn, 2, 7).unwrap().is_none());
+        assert!(wh_per_unit(Some(400.0), Some(100.0), Some(0.2), Some(2.0), "mi").is_none());
     }
 
     #[test]
