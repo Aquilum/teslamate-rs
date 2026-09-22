@@ -24,7 +24,45 @@ function toLocalInput(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+let currentRange = "30d";
+const RANGE_LABEL = {
+  "1d": "24h",
+  "7d": "7 days",
+  "30d": "30 days",
+  "90d": "90 days",
+  "1y": "1 year",
+  all: "All time",
+};
+
+function rangeSpanLabel() {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const short = (v) => {
+    const m = String(v || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return "";
+    return `${Number(m[3])} ${months[Number(m[2]) - 1]}`;
+  };
+  const a = short($("from")?.value);
+  const b = short($("to")?.value);
+  return a && b ? `${a} – ${b}` : "Dates";
+}
+
+function paintRange() {
+  const btn = $("range-toggle");
+  if (!btn) return;
+  btn.textContent = RANGE_LABEL[currentRange] || rangeSpanLabel();
+  btn.setAttribute("aria-expanded", $("range")?.classList.contains("open") ? "true" : "false");
+  document.querySelectorAll(".presets button").forEach((b) => {
+    b.classList.toggle("is-on", b.dataset.range === currentRange);
+  });
+}
+
+function setRangeOpen(open) {
+  $("range")?.classList.toggle("open", open);
+  paintRange();
+}
+
 function applyRange(key) {
+  currentRange = key;
   const to = new Date();
   const from = new Date(to);
   if (key === "1d") from.setDate(to.getDate() - 1);
@@ -35,6 +73,7 @@ function applyRange(key) {
   else if (key === "all") from.setFullYear(2016, 0, 1);
   $("from").value = toLocalInput(from);
   $("to").value = toLocalInput(to);
+  paintRange();
 }
 
 function parseGrafanaTimeFrom(rel, toMs) {
@@ -2413,12 +2452,21 @@ async function boot() {
   document.querySelectorAll(".presets button").forEach((b) =>
     b.addEventListener("click", () => {
       applyRange(b.dataset.range);
+      if (window.matchMedia("(max-width: 800px)").matches) setRangeOpen(false);
       reloadView();
     })
   );
+  $("range-toggle")?.addEventListener("click", () => {
+    setRangeOpen(!$("range").classList.contains("open"));
+  });
   $("car").addEventListener("change", () => reloadView());
-  $("from").addEventListener("change", () => reloadView());
-  $("to").addEventListener("change", () => reloadView());
+  const noteCustomRange = () => {
+    currentRange = "";
+    paintRange();
+    reloadView();
+  };
+  $("from").addEventListener("change", noteCustomRange);
+  $("to").addEventListener("change", noteCustomRange);
   if (layoutSel) {
     layoutSel.addEventListener("change", () => {
       chooseLayout(layoutSel.value).catch((e) => {
