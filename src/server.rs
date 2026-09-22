@@ -9,9 +9,9 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rust_embed::RustEmbed;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::hash::{Hash, Hasher};
@@ -72,6 +72,8 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         .route("/api/health", get(health))
         .route("/api/cars", get(cars))
         .route("/api/cars/{id}/live", get(car_live))
+        .route("/api/cars/{car_id}/drives/{drive_id}", get(car_drive))
+        .route("/api/cars/{car_id}/charges/{charge_id}", get(car_charge))
         .route("/api/settings", get(settings))
         .route("/api/dashboards", get(list_dashboards))
         .route("/api/dashboards/{*path}", get(get_dashboard))
@@ -91,7 +93,10 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
 async fn security_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
-    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     headers.insert(
@@ -109,11 +114,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
 
 async fn index() -> impl IntoResponse {
     match Web::get("index.html") {
-        Some(f) => (
-            [(header::CACHE_CONTROL, "no-store")],
-            Html(f.data.to_vec()),
-        )
-            .into_response(),
+        Some(f) => ([(header::CACHE_CONTROL, "no-store")], Html(f.data.to_vec())).into_response(),
         None => (StatusCode::NOT_FOUND, "missing web/index.html").into_response(),
     }
 }
@@ -180,6 +181,36 @@ async fn car_live(
     Path(id): Path<i64>,
 ) -> Result<Response, AppError> {
     let view = spawn_db(app.db.clone(), move |conn| crate::live::live_view(conn, id)).await?;
+    Ok(match view {
+        Some(v) => Json(v).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
+}
+
+async fn car_drive(
+    _user: AuthUser,
+    State(app): State<App>,
+    Path((car_id, drive_id)): Path<(i64, i64)>,
+) -> Result<Response, AppError> {
+    let view = spawn_db(app.db.clone(), move |conn| {
+        crate::detail::drive_detail(conn, car_id, drive_id)
+    })
+    .await?;
+    Ok(match view {
+        Some(v) => Json(v).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
+}
+
+async fn car_charge(
+    _user: AuthUser,
+    State(app): State<App>,
+    Path((car_id, charge_id)): Path<(i64, i64)>,
+) -> Result<Response, AppError> {
+    let view = spawn_db(app.db.clone(), move |conn| {
+        crate::detail::charge_detail(conn, car_id, charge_id)
+    })
+    .await?;
     Ok(match view {
         Some(v) => Json(v).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -363,19 +394,14 @@ fn execute_dashboard_query(
         if cancelled.load(Ordering::Relaxed) {
             return cancelled_json();
         }
-        let aux = crate::db::battery_aux(
-            &conn,
-            vars.car_id,
-            &vars.length_unit,
-            &vars.preferred_range,
-        );
+        let aux =
+            crate::db::battery_aux(&conn, vars.car_id, &vars.length_unit, &vars.preferred_range);
         drop(conn);
         vars.extras.insert("aux".into(), aux);
     }
-    let translated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        sql::translate(&sql, &vars)
-    }))
-    .unwrap_or_else(|_| sql.clone());
+    let translated =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sql::translate(&sql, &vars)))
+            .unwrap_or_else(|_| sql.clone());
     let key = cache_key(&translated);
     let t0 = Instant::now();
     if let Some(hit) = cache.get(key) {
@@ -484,11 +510,10 @@ async fn run_query(
     let sql = body.sql;
     let vars = body.vars;
     let flag = cancelled.clone();
-    let payload = tokio::task::spawn_blocking(move || {
-        execute_dashboard_query(&db, &cache, sql, vars, &flag)
-    })
-    .await
-    .map_err(|e| AppError(anyhow::anyhow!("query task: {e}")))?;
+    let payload =
+        tokio::task::spawn_blocking(move || execute_dashboard_query(&db, &cache, sql, vars, &flag))
+            .await
+            .map_err(|e| AppError(anyhow::anyhow!("query task: {e}")))?;
     Ok(Json(payload))
 }
 
@@ -577,8 +602,8 @@ mod query_cancel_tests {
         let v = execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["rows"][0]["n"], json!(1));
-        let again = execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
+        let again =
+            execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
         assert_eq!(again["ok"], json!(true));
     }
 }
-

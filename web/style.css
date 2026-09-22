@@ -143,10 +143,36 @@ tr.row-warn:hover td, tr.row-bad:hover td { filter: brightness(1.12); }
 .soc-bar { position: relative; height: 10px; background: #2a2e38; border-radius: 6px; margin: 10px 0; overflow: hidden; }
 .soc-bar > span { display: block; height: 100%; background: var(--accent); }
 .soc-bar > i { position: absolute; top: -2px; width: 2px; height: 14px; background: #d8dde8; }
-.soc-meta, .live-note { color: var(--muted); font-size: 12px; }
+.soc-meta, .soc-alt, .live-note { color: var(--muted); font-size: 12px; }
+.soc-alt { margin: 4px 0 0; }
 .live-charge, .live-drive { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px 14px; }
 .live-charge b, .live-drive b { font-weight: 600; }
-.live-map { min-height: 220px; height: 100%; background: #0e1014; border-radius: 6px; border: 1px solid var(--border); }
+.live-place { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.live-map { min-height: 220px; height: 100%; flex: 1; background: #0e1014; border-radius: 6px; border: 1px solid var(--border); }
+.live-where { margin: 0; color: var(--muted); font-size: 13px; }
+tr.row-open { cursor: pointer; }
+tr.row-open:hover td { background: rgba(232, 93, 4, 0.08); }
+tr.row-open.is-open td { background: rgba(232, 93, 4, 0.16); }
+tr.row-open:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.story {
+  grid-column: 1 / -1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.story-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.story-title { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0.01em; }
+.story-sub { margin: 4px 0 0; color: var(--muted); }
+.story-close { border-radius: 999px; }
+.story-map { height: 200px; border-radius: 6px; border: 1px solid var(--border); background: #0e1014; }
+.story-spark { width: 100%; height: 56px; display: block; }
+.story-spark polyline { fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.story-spark-wrap span { color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+.story-wait { margin: 0; color: var(--muted); }
 .live-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
 .fact { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
 .fact h3 { margin: 0 0 6px; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }

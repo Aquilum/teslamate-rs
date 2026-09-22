@@ -1,7 +1,8 @@
 teslamate-rs (0.1.0-2) UNRELEASED; urgency=medium
 
   * Optional grouped UI (vehicle, battery, trips, software), chosen per account.
-  * Live vehicle view from the last Tesla API poll (locks, sentry, tires, route).
+  * Live vehicle view from the last Tesla API poll (place, locks, sentry, tires, range).
+  * Grouped drives and charges open in place, with the route or the power curve.
   * PAM authentication, passkeys, and user profiles (AstonMate-shaped).
   * Cancel in-flight dashboard queries, cache results, and roll up GPS hourly.
   * Sync Tesla Supercharger invoices and add teslamate-rs refresh (no wake_up).

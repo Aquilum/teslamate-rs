@@ -854,19 +854,39 @@ function emptyCol(rows, col) {
   return !(rows || []).some((r) => r[col] != null && r[col] !== "");
 }
 
+function storyRowId(kind, row) {
+  const keys = kind === "drive" ? ["drive_id", "Drive ID"] : ["id", "charging_process_id", "Charging Process ID"];
+  for (const key of keys) {
+    if (row[key] != null && row[key] !== "") return row[key];
+  }
+  const names = Object.keys(row);
+  for (const key of keys) {
+    const found = names.find((k) => k.toLowerCase() === key.toLowerCase());
+    if (found && row[found] != null && row[found] !== "") return row[found];
+  }
+  return null;
+}
+
 function drawTable(body, panel, cols, rows) {
   const slice = sortRowsByDate(cols, rows).slice(0, 500);
   const show = cols.filter((c) => !hiddenCol(c, panel) && !emptyCol(slice, c));
   const headers = show.length ? show : cols.filter((c) => !hiddenCol(c, panel));
   const isVampire = headers.some((c) => /range_lost_per_hour|standby/.test(c));
   const stats = isVampire ? vampireStats(slice) : null;
+  const open = body.closest(".panel")?.dataset.open || "";
   body.innerHTML =
     `<table><thead><tr>${headers.map((c) => `<th>${escapeHtml(headerLabel(panel, c))}</th>`).join("")}</tr></thead><tbody>` +
     slice
       .map((r) => {
         const sev = isVampire ? vampireRowClass(r, stats) : { cls: "", title: "" };
-        const tr = ` class="${sev.cls}"` + (sev.title ? ` title="${escapeHtml(sev.title)}"` : "");
-        return `<tr${tr}>${headers
+        const id = open ? storyRowId(open, r) : null;
+        const cls = [id != null ? "row-open" : "", sev.cls].filter(Boolean).join(" ");
+        const title = sev.title || (id != null ? (open === "drive" ? "Open this drive" : "Open this charge") : "");
+        const attrs =
+          (cls ? ` class="${cls}"` : "") +
+          (title ? ` title="${escapeHtml(title)}"` : "") +
+          (id != null ? ` data-open-id="${escapeHtml(String(id))}" tabindex="0" role="button"` : "");
+        return `<tr${attrs}>${headers
           .map((c) => {
             const cell = formatCell(panel, c, r[c]);
             const st = cell.color && cell.color !== "transparent" ? ` style="color:${cell.color};font-weight:600"` : "";
@@ -1663,7 +1683,7 @@ const META = [
   {
     id: "vehicle",
     title: "Vehicle",
-    lead: "What the car is doing now — locks, sentry, tires, climate, and the route — from the last Tesla API poll. Those never had a Grafana page. Charge history, trips, and firmware each live on their own page.",
+    lead: "Where the car is, and what it is doing — locks, sentry, tires, and climate — from the last Tesla API poll.",
     live: true,
     sections: [
       {
@@ -1680,7 +1700,7 @@ const META = [
   {
     id: "battery",
     title: "Battery",
-    lead: "Level, health, and charging. The live state of charge stays on Vehicle, so it is not drawn again here.",
+    lead: "Level, health, and every charge. Open a row to see the place and how the power came in.",
     sections: [
       { title: "Level", panels: [["charge-level.json", 2]] },
       {
@@ -1737,7 +1757,7 @@ const META = [
   {
     id: "trips",
     title: "Trips",
-    lead: "Distance, efficiency, and places. Consumption is here, not copied onto the battery page.",
+    lead: "Distance, efficiency, and places. Open a drive to follow the route.",
     sections: [
       {
         title: "This period",
@@ -1924,6 +1944,28 @@ function chip(text, kind) {
   return `<span class="chip${kind ? " " + kind : ""}">${escapeHtml(text)}</span>`;
 }
 
+function rangeApart(a, b) {
+  const x = Number(a);
+  const y = Number(b);
+  if (!Number.isFinite(x)) return false;
+  if (!Number.isFinite(y)) return true;
+  return Math.abs(x - y) > 1;
+}
+
+function climateLine(c, temp) {
+  const bits = [];
+  if (c.inside != null) bits.push(`Inside ${n1(c.inside)}°${temp}`);
+  if (c.outside != null) bits.push(`Outside ${n1(c.outside)}°${temp}`);
+  if (c.setpoint != null) bits.push(`Set ${n1(c.setpoint)}°${temp}`);
+  const set = Number(c.setpoint);
+  const pass = Number(c.passenger);
+  if (Number.isFinite(pass) && (!Number.isFinite(set) || Math.abs(pass - set) >= 0.5)) {
+    bits.push(`Passenger ${n1(pass)}°${temp}`);
+  }
+  if (c.defrostFront || c.defrostRear) bits.push("defrost");
+  return bits.join(" · ") || "–";
+}
+
 function paintLive(host, data) {
   if (host._map) {
     host._map.remove();
@@ -1992,8 +2034,19 @@ function paintLive(host, data) {
     const cls = t.warning ? "warn" : "";
     return `<div><span>${label}</span><span class="${cls}">${t.pressure == null ? "–" : n1(t.pressure) + " " + escapeHtml(pres)}</span></div>`;
   };
+  const prefer = data.preferredRange === "ideal" ? "ideal" : "rated";
+  const alts = [];
+  if (prefer !== "rated" && rangeApart(b.rated, b.range)) alts.push(`${n1(b.rated)} ${unit} rated`);
+  if (prefer !== "ideal" && rangeApart(b.ideal, b.range)) alts.push(`${n1(b.ideal)} ${unit} ideal`);
+  if (rangeApart(b.est, b.range)) alts.push(`${n1(b.est)} ${unit} estimated`);
+  const where = [
+    data.place || "",
+    data.elevation != null ? `${n1(data.elevation)} ${data.elevationUnit || "m"}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const facts = [
-    ["Climate", [c.inside != null ? `Inside ${n1(c.inside)}°${temp}` : "", c.outside != null ? `Outside ${n1(c.outside)}°${temp}` : "", c.setpoint != null ? `Set ${n1(c.setpoint)}°${temp}` : ""].filter(Boolean).join(" · ") || "–"],
+    ["Climate", climateLine(c, temp)],
     ["Tires", ""],
     ["Odometer", data.odometer == null ? "–" : `${n1(data.odometer)} ${unit}`],
     ["Software", sw.version || "–"],
@@ -2013,9 +2066,13 @@ function paintLive(host, data) {
         <div class="soc">${Number.isFinite(level) ? escapeHtml(String(level)) : "–"}<span>%</span></div>
         <div class="soc-bar"><span style="width:${Number.isFinite(level) ? Math.max(0, Math.min(100, level)) : 0}%"></span>${Number.isFinite(limit) ? `<i style="left:${Math.max(0, Math.min(100, limit))}%"></i>` : ""}</div>
         <div class="soc-meta">${b.range != null ? n1(b.range) + " " + escapeHtml(unit) + " " + escapeHtml(data.preferredRange || "rated") : "Range –"}${Number.isFinite(limit) ? " · limit " + limit + "%" : ""}${b.usable != null && b.usable !== b.level ? " · usable " + b.usable + "%" : ""}</div>
+        ${alts.length ? `<p class="soc-alt">${escapeHtml(alts.join(" · "))}</p>` : ""}
         ${motion}
       </div>
-      <div class="live-map" id="live-map"></div>
+      <div class="live-place">
+        <div class="live-map" id="live-map"></div>
+        ${where ? `<p class="live-where">${escapeHtml(where)}</p>` : ""}
+      </div>
     </div>
     <div class="live-facts">
       <div class="fact"><h3>Climate</h3><p>${escapeHtml(facts[0][1])}</p></div>
@@ -2036,6 +2093,7 @@ function paintLive(host, data) {
     }).addTo(map);
     L.circleMarker([lat, lon], { radius: 8, color: "#e85d04", fillOpacity: 0.85, weight: 1 }).addTo(map);
     host._map = map;
+    mapEl._map = map;
     requestAnimationFrame(() => map.invalidateSize());
   } else if (mapEl) {
     mapEl.textContent = "No position yet";
@@ -2054,6 +2112,183 @@ async function fillLive(host, ctl) {
   if (!stale(ctl)) liveTimer = setTimeout(() => fillLive(host, ctl), 30000);
 }
 
+let storyGen = 0;
+
+function dropMaps(root) {
+  if (!root) return;
+  const nodes = [root, ...root.querySelectorAll("*")];
+  for (const el of nodes) {
+    if (el._map) {
+      el._map.remove();
+      el._map = null;
+    }
+  }
+}
+
+function storyWhen(s) {
+  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!m) return s ? String(s) : "";
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${Number(m[3])} ${months[Number(m[2]) - 1]} · ${m[4]}:${m[5]}`;
+}
+
+function storyLine(data, kind) {
+  if (kind === "charge") {
+    const power = (data.curve || []).map((p) => p.power);
+    if (power.filter((n) => Number.isFinite(Number(n))).length >= 2) return { values: power, label: "Charger power" };
+    return { values: (data.curve || []).map((p) => p.soc), label: "State of charge" };
+  }
+  const soc = data.soc || [];
+  const finite = soc.map(Number).filter(Number.isFinite);
+  if (finite.length >= 2 && Math.max(...finite) - Math.min(...finite) >= 1) return { values: soc, label: "State of charge" };
+  const elev = data.elevation || [];
+  if (elev.map(Number).filter(Number.isFinite).length >= 2) {
+    return { values: elev, label: data.lengthUnit === "mi" ? "Elevation, ft" : "Elevation, m" };
+  }
+  if (finite.length >= 2) return { values: soc, label: "State of charge" };
+  return null;
+}
+
+function sparkSvg(spec) {
+  if (!spec) return "";
+  const nums = spec.values.map(Number).filter(Number.isFinite);
+  if (nums.length < 2) return "";
+  const w = 640;
+  const h = 64;
+  const pad = 6;
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  const span = max - min || 1;
+  const pts = nums
+    .map((v, i) => {
+      const x = pad + (i / (nums.length - 1)) * (w - pad * 2);
+      const y = pad + (1 - (v - min) / span) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return `<div class="story-spark-wrap"><svg viewBox="0 0 ${w} ${h}" class="story-spark" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" /></svg><span>${escapeHtml(spec.label)}</span></div>`;
+}
+
+function mountPath(el, path) {
+  const pts = (path || []).filter((p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1])));
+  if (!pts.length || typeof L === "undefined") {
+    el.remove();
+    return;
+  }
+  const map = L.map(el, { zoomControl: false, attributionControl: false });
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+  if (pts.length === 1) {
+    map.setView(pts[0], 14);
+    L.circleMarker(pts[0], { radius: 7, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 0.9, weight: 1 }).addTo(map);
+  } else {
+    const line = L.polyline(pts, { color: "#e85d04", weight: 3, opacity: 0.95 }).addTo(map);
+    map.fitBounds(line.getBounds(), { padding: [18, 18] });
+    L.circleMarker(pts[0], { radius: 4, color: "#d8dde8", fillColor: "#d8dde8", fillOpacity: 1, weight: 0 }).addTo(map);
+    L.circleMarker(pts[pts.length - 1], { radius: 6, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 1, weight: 0 }).addTo(map);
+  }
+  el._map = map;
+  requestAnimationFrame(() => map.invalidateSize());
+}
+
+function paintStory(card, kind, data) {
+  const unit = data.lengthUnit || "km";
+  const when = storyWhen(data.start);
+  let title;
+  const bits = [when];
+  if (kind === "drive") {
+    const from = data.from || "Start";
+    const to = data.to || "End";
+    title = from === to ? from : `${from} → ${to}`;
+    if (data.distance != null) bits.push(`${n1(data.distance)} ${unit}`);
+    if (data.durationMin != null) {
+      const dur = hoursLabel(null, data.durationMin);
+      if (dur) bits.push(dur);
+    }
+    if (data.socStart != null && data.socEnd != null) bits.push(`${data.socStart}% → ${data.socEnd}%`);
+    if (data.consumption != null) bits.push(`${n1(data.consumption)} Wh/${unit}`);
+    if (data.open) bits.push("still driving");
+  } else {
+    title = data.place || "Charge";
+    if (data.energyAddedKwh != null) bits.push(`${n1(data.energyAddedKwh)} kWh`);
+    if (data.durationMin != null) {
+      const dur = hoursLabel(null, data.durationMin);
+      if (dur) bits.push(dur);
+    }
+    if (data.socStart != null && data.socEnd != null) bits.push(`${data.socStart}% → ${data.socEnd}%`);
+    const powers = (data.curve || []).map((p) => Number(p.power)).filter(Number.isFinite);
+    const vary = powers.length >= 2 && Math.max(...powers) - Math.min(...powers) > 1;
+    if (data.powerMax != null) bits.push(vary ? `up to ${n1(data.powerMax)} kW` : `${n1(data.powerMax)} kW`);
+    if (data.cost != null && Number(data.cost) > 0) bits.push(`cost ${Number(data.cost).toFixed(2)}`);
+    if (data.open) bits.push("still charging");
+  }
+  card.innerHTML = `<div class="story-head">
+      <div><h3 class="story-title">${escapeHtml(title)}</h3><p class="story-sub">${escapeHtml(bits.filter(Boolean).join(" · "))}</p></div>
+      <button type="button" class="story-close" aria-label="Close">Close</button>
+    </div>
+    <div class="story-map"></div>
+    ${sparkSvg(storyLine(data, kind))}`;
+  const mapEl = card.querySelector(".story-map");
+  if (mapEl) mountPath(mapEl, data.path);
+}
+
+function dismissStory(story) {
+  if (!story) return;
+  storyGen += 1;
+  const map = story.querySelector(".story-map");
+  if (map?._map) {
+    map._map.remove();
+    map._map = null;
+  }
+  story.remove();
+}
+
+async function openStory(panel, id) {
+  const kind = panel.dataset.open;
+  const gen = ++storyGen;
+  const card = document.createElement("article");
+  card.className = "story";
+  card.dataset.storyId = String(id);
+  card.dataset.storyKind = kind;
+  card.innerHTML = `<p class="story-wait">Opening…</p>`;
+  panel.before(card);
+  card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  try {
+    const car = vars().car_id;
+    const url = kind === "drive" ? `/api/cars/${car}/drives/${encodeURIComponent(id)}` : `/api/cars/${car}/charges/${encodeURIComponent(id)}`;
+    const data = await api(url);
+    if (gen !== storyGen || !card.isConnected) return;
+    paintStory(card, kind, data);
+  } catch (e) {
+    if (gen !== storyGen || !card.isConnected) return;
+    card.innerHTML = `<p class="err">${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function onBoardActivate(ev) {
+  const board = $("board");
+  if (!board) return;
+  const close = ev.type === "click" ? ev.target.closest?.(".story-close") : null;
+  if (close && board.contains(close)) {
+    const story = close.closest(".story");
+    story?.parentElement?.querySelectorAll("tr.is-open").forEach((tr) => tr.classList.remove("is-open"));
+    dismissStory(story);
+    return;
+  }
+  const tr = ev.target.closest?.("tr.row-open");
+  if (!tr || !board.contains(tr)) return;
+  if (ev.type === "keydown" && ev.key !== "Enter" && ev.key !== " ") return;
+  if (ev.type === "keydown") ev.preventDefault();
+  const panel = tr.closest(".panel");
+  const id = tr.dataset.openId;
+  if (!panel || !id) return;
+  const same = tr.classList.contains("is-open");
+  board.querySelectorAll("tr.is-open").forEach((row) => row.classList.remove("is-open"));
+  board.querySelectorAll(".story").forEach((s) => dismissStory(s));
+  if (same) return;
+  tr.classList.add("is-open");
+  openStory(panel, id);
+}
+
 async function loadGrouped(id) {
   const page = META.find((p) => p.id === id) || META[0];
   const gen = ++dashGen;
@@ -2065,6 +2300,7 @@ async function loadGrouped(id) {
   renderNav();
   $("title").textContent = page.title;
   const board = $("board");
+  dropMaps(board);
   board.classList.add("grouped");
   board.style.height = "auto";
   board.innerHTML = `<p class="meta-lead">${escapeHtml(page.lead)}</p>`;
@@ -2107,6 +2343,9 @@ async function loadGrouped(id) {
           (g.h <= 3 ? " compact" : "") +
           (panel.type === "stat" || panel.type === "gauge" ? " panel-kpi" : "");
         el.style.gridColumn = `span ${flowSpan(panel)}`;
+        if ((path === "drives.json" && (id === 2 || id === 9)) || (path === "charges.json" && (id === 6 || id === 17))) {
+          el.dataset.open = path.startsWith("drives") ? "drive" : "charge";
+        }
         const bodyH = flowBodyHeight(panel);
         el.innerHTML = `<h3>${escapeHtml(interpTitle(panel.title || "", v, panel))}</h3><div class="body"></div>`;
         el.querySelector(".body").style.height = bodyH + "px";
@@ -2175,6 +2414,12 @@ async function boot() {
         $("invite-url").textContent = e.message || String(e);
       });
     });
+  }
+  const board = $("board");
+  if (board && !board.dataset.storyBound) {
+    board.dataset.storyBound = "1";
+    board.addEventListener("click", onBoardActivate);
+    board.addEventListener("keydown", onBoardActivate);
   }
   window.addEventListener("hashchange", () => {
     const hash = location.hash.replace(/^#/, "");

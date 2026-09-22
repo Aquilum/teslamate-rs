@@ -118,6 +118,20 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
     let show_pressure = if pressure == "psi" { "psi" } else { "bar" };
 
     let mut extras = Vec::new();
+    let mut car = car;
+    if car
+        .get("color")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
+        if let Some(color) = detail
+            .as_ref()
+            .and_then(|d| tesla::str_field(d, &["vehicle_config", "exterior_color"]))
+        {
+            car["color"] = json!(color);
+        }
+    }
 
     let battery = battery_block(
         detail.as_ref(),
@@ -126,7 +140,13 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
         &preferred,
         &mut extras,
     );
-    let drive = drive_block(detail.as_ref(), pos.as_ref(), length_unit, speed_unit, &mut extras);
+    let drive = drive_block(
+        detail.as_ref(),
+        pos.as_ref(),
+        length_unit,
+        speed_unit,
+        &mut extras,
+    );
     let climate = climate_block(detail.as_ref(), pos.as_ref(), show_temp, &mut extras);
     let body = body_block(detail.as_ref(), &mut extras);
     let tires = tires_block(detail.as_ref(), pos.as_ref(), show_pressure);
@@ -134,15 +154,26 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
     let odometer = odometer_block(detail.as_ref(), pos.as_ref(), length_unit);
 
     if let Some(d) = detail.as_ref() {
-        if let Some(color) = tesla::str_field(d, &["vehicle_config", "exterior_color"]) {
-            if car.get("color").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                extras.push(json!({"label": "Exterior", "value": color}));
-            }
-        }
         if let Some(wheels) = tesla::str_field(d, &["vehicle_config", "wheel_type"]) {
             extras.push(json!({"label": "Wheels", "value": wheels}));
         }
     }
+
+    let lat = drive.get("lat").and_then(|v| v.as_f64());
+    let lon = drive.get("lon").and_then(|v| v.as_f64());
+    let place = match (lat, lon) {
+        (Some(la), Some(lo)) => place_name(conn, la, lo)?,
+        _ => None,
+    };
+    let elevation = match (lat, lon, pos.as_ref()) {
+        (Some(la), Some(lo), Some(p)) => match (p.lat, p.lon, p.elevation_m) {
+            (Some(plat), Some(plon), Some(m)) if haversine_m(la, lo, plat, plon) <= 400.0 => {
+                Some(elevation_in(m as f64, length_unit))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
 
     Ok(Some(json!({
         "car": car,
@@ -162,6 +193,9 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
         "tires": tires,
         "software": software,
         "odometer": odometer,
+        "place": place,
+        "elevation": elevation,
+        "elevationUnit": if length_unit == "mi" { "ft" } else { "m" },
         "extras": extras,
     })))
 }
@@ -180,13 +214,18 @@ struct Pos {
     power: Option<i64>,
     odometer_km: Option<f64>,
     tpms: [Option<f64>; 4],
+    elevation_m: Option<i64>,
+    passenger: Option<f64>,
+    defrost_front: Option<i64>,
+    defrost_rear: Option<i64>,
 }
 
 fn latest_position(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Pos>> {
     conn.query_row(
         "SELECT battery_level, usable_battery_level, rated_battery_range_km, ideal_battery_range_km,
                 est_battery_range_km, outside_temp, inside_temp, latitude, longitude, speed, power,
-                odometer, tpms_pressure_fl, tpms_pressure_fr, tpms_pressure_rl, tpms_pressure_rr
+                odometer, tpms_pressure_fl, tpms_pressure_fr, tpms_pressure_rl, tpms_pressure_rr,
+                elevation, passenger_temp_setting, is_front_defroster_on, is_rear_defroster_on
          FROM positions WHERE car_id=?1 ORDER BY date DESC LIMIT 1",
         [car_id],
         |r| {
@@ -204,6 +243,10 @@ fn latest_position(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Po
                 power: r.get(10)?,
                 odometer_km: r.get(11)?,
                 tpms: [r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?],
+                elevation_m: r.get(16)?,
+                passenger: r.get(17)?,
+                defrost_front: r.get(18)?,
+                defrost_rear: r.get(19)?,
             })
         },
     )
@@ -222,10 +265,9 @@ fn battery_block(
         .or_else(|| pos.and_then(|p| p.battery_level));
     let usable = tesla::i64_field(d, &["charge_state", "usable_battery_level"])
         .or_else(|| pos.and_then(|p| p.usable));
-    let rated = range_miles(d, "battery_range").map(|mi| miles(mi, length)).or_else(|| {
-        pos.and_then(|p| p.rated_km)
-            .map(|km| km_to(km, length))
-    });
+    let rated = range_miles(d, "battery_range")
+        .map(|mi| miles(mi, length))
+        .or_else(|| pos.and_then(|p| p.rated_km).map(|km| km_to(km, length)));
     let ideal = range_miles(d, "ideal_battery_range")
         .map(|mi| miles(mi, length))
         .or_else(|| pos.and_then(|p| p.ideal_km).map(|km| km_to(km, length)));
@@ -299,11 +341,16 @@ fn drive_block(
                 .map(|kmh| km_to(kmh as f64, if speed_unit == "mph" { "mi" } else { "km" }))
         });
     let lat = tesla::f64_field(d, &["drive_state", "latitude"]).or_else(|| pos.and_then(|p| p.lat));
-    let lon = tesla::f64_field(d, &["drive_state", "longitude"]).or_else(|| pos.and_then(|p| p.lon));
-    let dest = meaningful(tesla::str_field(d, &["drive_state", "active_route", "destination"]));
+    let lon =
+        tesla::f64_field(d, &["drive_state", "longitude"]).or_else(|| pos.and_then(|p| p.lon));
+    let dest = meaningful(tesla::str_field(
+        d,
+        &["drive_state", "active_route", "destination"],
+    ));
     let miles_left = tesla::f64_field(d, &["drive_state", "active_route", "miles_to_arrival"]);
     let minutes = tesla::f64_field(d, &["drive_state", "active_route", "minutes_to_arrival"]);
-    if let Some(energy) = tesla::f64_field(d, &["drive_state", "active_route", "energy_at_arrival"]) {
+    if let Some(energy) = tesla::f64_field(d, &["drive_state", "active_route", "energy_at_arrival"])
+    {
         extras.push(json!({"label": "Energy at arrival", "value": format!("{energy:.0}%")}));
     }
     json!({
@@ -334,16 +381,28 @@ fn climate_block(
         .or_else(|| pos.and_then(|p| p.outside))
         .map(|c| c_to(c, unit));
     let set = tesla::f64_field(d, &["climate_state", "driver_temp_setting"]).map(|c| c_to(c, unit));
+    let passenger = tesla::f64_field(d, &["climate_state", "passenger_temp_setting"])
+        .or_else(|| pos.and_then(|p| p.passenger))
+        .map(|c| c_to(c, unit));
+    let defrost_front = tesla::bool_field(d, &["climate_state", "is_front_defroster_on"])
+        .or_else(|| pos.and_then(|p| p.defrost_front).map(|n| n != 0));
+    let defrost_rear = tesla::bool_field(d, &["climate_state", "is_rear_defroster_on"])
+        .or_else(|| pos.and_then(|p| p.defrost_rear).map(|n| n != 0));
     if tesla::bool_field(d, &["climate_state", "is_preconditioning"]) == Some(true) {
         extras.push(json!({"label": "Preconditioning", "value": "on"}));
     }
-    if let Some(keeper) = meaningful(tesla::str_field(d, &["climate_state", "climate_keeper_mode"])) {
+    if let Some(keeper) = meaningful(tesla::str_field(
+        d,
+        &["climate_state", "climate_keeper_mode"],
+    )) {
         if !keeper.eq_ignore_ascii_case("off") {
             extras.push(json!({"label": "Climate keeper", "value": keeper}));
         }
     }
-    if let Some(oh) = meaningful(tesla::str_field(d, &["climate_state", "cabin_overheat_protection"]))
-    {
+    if let Some(oh) = meaningful(tesla::str_field(
+        d,
+        &["climate_state", "cabin_overheat_protection"],
+    )) {
         if !oh.eq_ignore_ascii_case("off") {
             extras.push(json!({"label": "Cabin overheat", "value": oh}));
         }
@@ -367,9 +426,10 @@ fn climate_block(
         "inside": inside,
         "outside": outside,
         "setpoint": set,
+        "passenger": passenger,
         "on": tesla::bool_field(d, &["climate_state", "is_climate_on"]),
-        "defrostFront": tesla::bool_field(d, &["climate_state", "is_front_defroster_on"]),
-        "defrostRear": tesla::bool_field(d, &["climate_state", "is_rear_defroster_on"]),
+        "defrostFront": defrost_front,
+        "defrostRear": defrost_rear,
     })
 }
 
@@ -487,11 +547,14 @@ fn software_block(detail: Option<&Value>, extras: &mut Vec<Value>) -> Value {
 }
 
 fn odometer_block(detail: Option<&Value>, pos: Option<&Pos>, length: &str) -> Option<f64> {
-    if let Some(mi) = tesla::f64_field(detail.unwrap_or(&Value::Null), &["vehicle_state", "odometer"])
-    {
+    if let Some(mi) = tesla::f64_field(
+        detail.unwrap_or(&Value::Null),
+        &["vehicle_state", "odometer"],
+    ) {
         return Some(round1(miles(mi, length)));
     }
-    pos.and_then(|p| p.odometer_km).map(|km| round1(km_to(km, length)))
+    pos.and_then(|p| p.odometer_km)
+        .map(|km| round1(km_to(km, length)))
 }
 
 fn range_miles(v: &Value, key: &str) -> Option<f64> {
@@ -499,9 +562,8 @@ fn range_miles(v: &Value, key: &str) -> Option<f64> {
 }
 
 fn meaningful(s: Option<&str>) -> Option<&str> {
-    s.map(str::trim).filter(|t| {
-        !t.is_empty() && *t != "<invalid>" && !t.eq_ignore_ascii_case("null")
-    })
+    s.map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "<invalid>" && !t.eq_ignore_ascii_case("null"))
 }
 
 fn open_flag(v: &Value, path: &[&str]) -> bool {
@@ -515,8 +577,110 @@ fn miles(mi: f64, length: &str) -> f64 {
     round1(if length == "mi" { mi } else { mi * 1.609344 })
 }
 
-fn km_to(km: f64, length: &str) -> f64 {
+pub(crate) fn km_to(km: f64, length: &str) -> f64 {
     round1(if length == "mi" { km / 1.609344 } else { km })
+}
+
+pub(crate) fn elevation_in(meters: f64, length: &str) -> f64 {
+    round1(if length == "mi" {
+        meters * 3.2808399
+    } else {
+        meters
+    })
+}
+
+pub(crate) fn place_name(
+    conn: &Connection,
+    lat: f64,
+    lon: f64,
+) -> rusqlite::Result<Option<String>> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return Ok(None);
+    }
+    let mut best: Option<(f64, String)> = None;
+    let mut stmt = conn.prepare("SELECT name, latitude, longitude, radius FROM geofences")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, f64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (name, glat, glon, radius) = row?;
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let d = haversine_m(lat, lon, glat, glon);
+        if d <= radius.max(1) as f64 && best.as_ref().map(|(bd, _)| d < *bd).unwrap_or(true) {
+            best = Some((d, name.to_string()));
+        }
+    }
+    drop(stmt);
+    if let Some((_, name)) = best {
+        return Ok(Some(name));
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT name, road, city, latitude, longitude FROM addresses
+         WHERE latitude BETWEEN ?1 AND ?2 AND longitude BETWEEN ?3 AND ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![lat - 0.02, lat + 0.02, lon - 0.02, lon + 0.02],
+        |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        },
+    )?;
+    let mut nearest: Option<(f64, String)> = None;
+    for row in rows {
+        let (name, road, city, alat, alon) = row?;
+        let d = haversine_m(lat, lon, alat, alon);
+        if d > 250.0 {
+            continue;
+        }
+        let Some(label) = address_label(name, road, city) else {
+            continue;
+        };
+        if nearest.as_ref().map(|(bd, _)| d < *bd).unwrap_or(true) {
+            nearest = Some((d, label));
+        }
+    }
+    Ok(nearest.map(|(_, label)| label))
+}
+
+pub(crate) fn address_label(
+    name: Option<String>,
+    road: Option<String>,
+    city: Option<String>,
+) -> Option<String> {
+    let clean = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    if let Some(name) = clean(name) {
+        return Some(name);
+    }
+    let parts: Vec<String> = [clean(road), clean(city)].into_iter().flatten().collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6_371_000.0;
+    let p1 = lat1.to_radians();
+    let p2 = lat2.to_radians();
+    let dp = (lat2 - lat1).to_radians();
+    let dl = (lon2 - lon1).to_radians();
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * r * a.sqrt().asin()
 }
 
 fn c_to(c: f64, unit: &str) -> f64 {
@@ -529,7 +693,7 @@ fn pressure_to(raw: f64, unit: &str) -> f64 {
     round1(if unit == "psi" { bar / 0.0689476 } else { bar })
 }
 
-fn round1(n: f64) -> f64 {
+pub(crate) fn round1(n: f64) -> f64 {
     (n * 10.0).round() / 10.0
 }
 
@@ -547,11 +711,8 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO car_settings (id) VALUES (1)",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO car_settings (id) VALUES (1)", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO cars (id, eid, vid, inserted_at, updated_at, vin, name, model, trim_badging, settings_id)
              VALUES (1, 1, 2, '2026-01-01', '2026-01-01', 'VIN', 'Red S', 'S', 'Plaid', 1)",
@@ -621,5 +782,47 @@ mod tests {
         assert!((view["odometer"].as_f64().unwrap() - 100.0).abs() < 0.05);
         assert!((view["battery"]["range"].as_f64().unwrap() - 100.0).abs() < 0.05);
         assert!((view["tires"]["fl"]["pressure"].as_f64().unwrap() - 42.1).abs() < 0.15);
+    }
+
+    #[test]
+    fn place_and_color_come_from_the_spot_the_car_is_in() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO geofences (id, name, latitude, longitude, radius, inserted_at, updated_at)
+             VALUES (1, 'Home', 51.5, -0.12, 200, '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO positions (date, latitude, longitude, elevation, passenger_temp_setting,
+                is_front_defroster_on, car_id, battery_level)
+             VALUES ('2026-09-19 22:00:00', 51.5, -0.12, 30, 23.0, 1, 1, 61)",
+            [],
+        )
+        .unwrap();
+        let detail = json!({
+            "charge_state": {"battery_level": 61, "battery_range": 180.0, "ideal_battery_range": 200.0,
+                             "est_battery_range": 170.0},
+            "drive_state": {"latitude": 51.5, "longitude": -0.12},
+            "climate_state": {"driver_temp_setting": 21.0, "passenger_temp_setting": 23.0,
+                              "is_front_defroster_on": true, "inside_temp": 20.0},
+            "vehicle_config": {"exterior_color": "Red", "wheel_type": "Base19"}
+        });
+        record_snapshot(&conn, 1, "online", Some(&detail)).unwrap();
+        let view = live_view(&conn, 1).unwrap().unwrap();
+        assert_eq!(view["place"], json!("Home"));
+        assert!((view["elevation"].as_f64().unwrap() - 98.4).abs() < 0.15);
+        assert_eq!(view["elevationUnit"], json!("ft"));
+        assert_eq!(view["car"]["color"], json!("Red"));
+        assert_eq!(view["climate"]["passenger"], json!(23.0));
+        assert_eq!(view["climate"]["defrostFront"], json!(true));
+        let labels: Vec<&str> = view["extras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["label"].as_str())
+            .collect();
+        assert!(!labels.contains(&"Exterior"));
+        assert!(labels.contains(&"Wheels"));
     }
 }
