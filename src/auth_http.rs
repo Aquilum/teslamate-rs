@@ -76,8 +76,12 @@ fn setup_conflict(err: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     }
 }
 
-fn request_webauthn(app: &App, headers: &HeaderMap) -> Result<Webauthn, (StatusCode, Json<Value>)> {
-    app.auth.webauthn_from(headers).map_err(|_| {
+fn request_webauthn(
+    app: &App,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<Webauthn, (StatusCode, Json<Value>)> {
+    app.auth.webauthn_from(headers, peer).map_err(|_| {
         api_err(
             StatusCode::BAD_REQUEST,
             "passkeys need the public HTTPS origin nginx advertises (Host + X-Forwarded-Proto)",
@@ -87,6 +91,7 @@ fn request_webauthn(app: &App, headers: &HeaderMap) -> Result<Webauthn, (StatusC
 
 async fn auth_status(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     user: OptionalUser,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -101,8 +106,8 @@ async fn auth_status(
         "passwordBackend": app.password_backend.as_str(),
         "registerEnabled": app.password_backend == PasswordBackend::Local,
         "webauthn": {
-            "rpId": app.auth.rp_id_from(&headers),
-            "origin": app.auth.origin_from(&headers),
+            "rpId": app.auth.rp_id_from(&headers, Some(peer)),
+            "origin": app.auth.origin_from(&headers, Some(peer)),
         },
     });
     if let Some(user) = user.0 {
@@ -151,7 +156,7 @@ async fn auth_setup(
         let username = normalize_username(&body.username).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
         let password = body.password.unwrap_or_default();
         let user = pam_provision_user(&app.db, &username, &password).await?;
-        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
         crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (pam)");
         return Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))));
     }
@@ -162,7 +167,7 @@ async fn auth_setup(
         let conn = app.db.lock();
         users::create_first_admin(&conn, &username, Some(&hash), None).map_err(setup_conflict)?
     };
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
     crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (local)");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
@@ -207,7 +212,7 @@ async fn auth_register(
             }
         })?
     };
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
     crate::audit::record(&app.db, Some(&user.username), "register", "invite redeemed");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
@@ -224,7 +229,7 @@ async fn auth_login(
     let password = body.password.unwrap_or_default();
     if app.password_backend == PasswordBackend::Pam {
         let user = pam_provision_user(&app.db, &username, &password).await?;
-        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
         crate::audit::record(&app.db, Some(&user.username), "login", "pam");
         return Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))));
     }
@@ -244,13 +249,14 @@ async fn auth_login(
         crate::audit::record(&app.db, Some(&username), "login_failed", "bad password");
         return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
     }
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
     crate::audit::record(&app.db, Some(&user.username), "login", "local");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
 async fn auth_logout(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
@@ -259,7 +265,7 @@ async fn auth_logout(
         let _ = users::delete_session(&conn, &token);
     }
     Ok((
-        jar.remove(app.auth.session_cookie_key(&headers)),
+        jar.remove(app.auth.session_cookie_key(&headers, Some(peer))),
         Json(json!({ "ok": true })),
     ))
 }
@@ -267,6 +273,7 @@ async fn auth_logout(
 async fn auth_logout_all(
     user: AuthUser,
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
@@ -281,7 +288,7 @@ async fn auth_logout_all(
         &format!("revoked {n} session(s)"),
     );
     Ok((
-        jar.remove(app.auth.session_cookie_key(&headers)),
+        jar.remove(app.auth.session_cookie_key(&headers, Some(peer))),
         Json(json!({ "ok": true, "revoked": n })),
     ))
 }
@@ -375,7 +382,7 @@ async fn wa_register_start(
     };
 
     let uuid_str = uuid.to_string();
-    let webauthn = request_webauthn(&app, &headers)?;
+    let webauthn = request_webauthn(&app, &headers, Some(peer))?;
     let (ccr, state) = webauthn
         .start_passkey_registration(uuid, &display, &display, exclude)
         .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -395,7 +402,7 @@ async fn wa_register_start(
         )
         .map_err(internal_err)?;
     }
-    let jar = jar.add(app.auth.wa_cookie(&challenge_id, &headers));
+    let jar = jar.add(app.auth.wa_cookie(&challenge_id, &headers, Some(peer)));
     Ok((jar, Json(serde_json::to_value(ccr).map_err(internal_err)?)))
 }
 
@@ -408,6 +415,7 @@ struct WebauthnFinish {
 
 async fn wa_register_finish(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     user: OptionalUser,
@@ -426,11 +434,11 @@ async fn wa_register_finish(
         serde_json::from_str(&challenge.state_json).map_err(internal_err)?;
     let cred: RegisterPublicKeyCredential =
         serde_json::from_value(body.credential).map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let passkey = request_webauthn(&app, &headers)?
+    let passkey = request_webauthn(&app, &headers, Some(peer))?
         .finish_passkey_registration(&cred, &state)
         .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let mut jar = jar.remove(app.auth.wa_cookie_key(&headers));
+    let mut jar = jar.remove(app.auth.wa_cookie_key(&headers, Some(peer)));
     match challenge.purpose.as_str() {
         "add" => {
             let session = user
@@ -470,7 +478,7 @@ async fn wa_register_finish(
                     .map_err(setup_conflict)?
             };
             store_passkey(&app.db, user.id, &passkey).map_err(internal_err)?;
-            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
             crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (passkey)");
             Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
         }
@@ -498,7 +506,7 @@ async fn wa_register_finish(
                 .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?
             };
             store_passkey(&app.db, user.id, &passkey).map_err(internal_err)?;
-            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
             crate::audit::record(&app.db, Some(&user.username), "register", "invite redeemed (passkey)");
             Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
         }
@@ -539,7 +547,7 @@ async fn wa_login_start(
     if keys.is_empty() {
         return Err(failed());
     }
-    let (ccr, state) = request_webauthn(&app, &headers)?
+    let (ccr, state) = request_webauthn(&app, &headers, Some(peer))?
         .start_passkey_authentication(&keys)
         .map_err(|_| api_err(StatusCode::BAD_REQUEST, "passkey sign-in failed"))?;
     let state_json = serde_json::to_string(&state).map_err(internal_err)?;
@@ -559,7 +567,7 @@ async fn wa_login_start(
         .map_err(internal_err)?;
     }
     Ok((
-        jar.add(app.auth.wa_cookie(&challenge_id, &headers)),
+        jar.add(app.auth.wa_cookie(&challenge_id, &headers, Some(peer))),
         Json(serde_json::to_value(ccr).map_err(internal_err)?),
     ))
 }
@@ -585,7 +593,7 @@ async fn wa_login_finish(
         serde_json::from_value(body.credential).map_err(|_| api_err(StatusCode::BAD_REQUEST, "passkey sign-in failed"))?;
     let state: PasskeyAuthentication =
         serde_json::from_str(&challenge.state_json).map_err(internal_err)?;
-    let result = request_webauthn(&app, &headers)?
+    let result = request_webauthn(&app, &headers, Some(peer))?
         .finish_passkey_authentication(&cred, &state)
         .map_err(|_| api_err(StatusCode::UNAUTHORIZED, "passkey sign-in failed"))?;
     let user_id = challenge
@@ -599,8 +607,8 @@ async fn wa_login_finish(
     let keys = passkeys_of(&app.db, user.id).map_err(internal_err)?;
     apply_auth_result(&app, &user, &result, &keys)?;
 
-    let jar = jar.remove(app.auth.wa_cookie_key(&headers));
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = jar.remove(app.auth.wa_cookie_key(&headers, Some(peer)));
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
     crate::audit::record(&app.db, Some(&user.username), "login", "passkey");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }

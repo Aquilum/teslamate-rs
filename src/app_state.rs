@@ -181,13 +181,15 @@ pub struct AuthLimiter {
 
 impl AuthLimiter {
     pub fn allow(&self, key: &str) -> bool {
-        const WINDOW: Duration = Duration::from_secs(15 * 60);
-        const MAX: usize = 30;
+        self.allow_budget(key, 30, Duration::from_secs(15 * 60))
+    }
+
+    pub fn allow_budget(&self, key: &str, max: usize, window: Duration) -> bool {
         let now = Instant::now();
         let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(key.to_string()).or_default();
-        entry.retain(|t| now.duration_since(*t) < WINDOW);
-        if entry.len() >= MAX {
+        entry.retain(|t| now.duration_since(*t) < window);
+        if entry.len() >= max {
             return false;
         }
         entry.push(now);
@@ -197,7 +199,21 @@ impl AuthLimiter {
 
 const DEFAULT_QUERY_PER_USER: usize = 4;
 const DEFAULT_QUERY_GLOBAL: usize = 32;
+const DEFAULT_QUERY_RATE_MAX: usize = 300;
 const QUERY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+const QUERY_RATE_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+pub fn query_rate_window() -> Duration {
+    QUERY_RATE_WINDOW
+}
+
+pub fn query_rate_max() -> usize {
+    std::env::var("TESLAMATE_RS_QUERY_RATE_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_RATE_MAX)
+        .clamp(30, 10_000)
+}
 
 fn query_per_user_limit() -> usize {
     std::env::var("TESLAMATE_RS_QUERY_CONCURRENCY")
@@ -341,5 +357,15 @@ mod tests {
         assert!(gate.try_acquire(2).await.is_err());
         drop(a);
         gate.try_acquire(2).await.expect("after release");
+    }
+
+    #[test]
+    fn limiter_budget_is_independent_per_key() {
+        let lim = AuthLimiter::default();
+        let w = Duration::from_secs(60);
+        assert!(lim.allow_budget("query:1", 2, w));
+        assert!(lim.allow_budget("query:1", 2, w));
+        assert!(!lim.allow_budget("query:1", 2, w));
+        assert!(lim.allow_budget("query:2", 2, w));
     }
 }

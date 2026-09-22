@@ -7,6 +7,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
+use std::net::SocketAddr;
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
@@ -53,42 +54,54 @@ impl AuthState {
         })
     }
 
-    pub fn session_cookie(&self, token: &str, headers: &HeaderMap) -> Cookie<'static> {
+    pub fn session_cookie(
+        &self,
+        token: &str,
+        headers: &HeaderMap,
+        peer: Option<SocketAddr>,
+    ) -> Cookie<'static> {
         apply_cookie(
             Cookie::new(SESSION_COOKIE, token.to_owned()),
-            self.secure_from(headers),
+            self.secure_from(headers, peer),
         )
     }
 
-    pub fn wa_cookie(&self, id: &str, headers: &HeaderMap) -> Cookie<'static> {
-        apply_cookie(Cookie::new(WA_COOKIE, id.to_owned()), self.secure_from(headers))
+    pub fn wa_cookie(&self, id: &str, headers: &HeaderMap, peer: Option<SocketAddr>) -> Cookie<'static> {
+        apply_cookie(
+            Cookie::new(WA_COOKIE, id.to_owned()),
+            self.secure_from(headers, peer),
+        )
     }
 
-    pub fn session_cookie_key(&self, headers: &HeaderMap) -> Cookie<'static> {
-        apply_cookie(Cookie::from(SESSION_COOKIE), self.secure_from(headers))
+    pub fn session_cookie_key(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Cookie<'static> {
+        apply_cookie(
+            Cookie::from(SESSION_COOKIE),
+            self.secure_from(headers, peer),
+        )
     }
 
-    pub fn wa_cookie_key(&self, headers: &HeaderMap) -> Cookie<'static> {
-        apply_cookie(Cookie::from(WA_COOKIE), self.secure_from(headers))
+    pub fn wa_cookie_key(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Cookie<'static> {
+        apply_cookie(Cookie::from(WA_COOKIE), self.secure_from(headers, peer))
     }
 
-    pub fn secure_from(&self, headers: &HeaderMap) -> bool {
-        self.secure_cookie || public_origin(headers, &self.origin).starts_with("https://")
+    pub fn secure_from(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+        self.secure_cookie || public_origin(headers, &self.origin, peer).starts_with("https://")
     }
 
-    pub fn origin_from(&self, headers: &HeaderMap) -> String {
-        public_origin(headers, &self.origin)
+    pub fn origin_from(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+        public_origin(headers, &self.origin, peer)
     }
 
-    pub fn rp_id_from(&self, headers: &HeaderMap) -> String {
-        rp_id_for_origin(&self.origin_from(headers)).unwrap_or_else(|_| self.rp_id.clone())
+    pub fn rp_id_from(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+        rp_id_for_origin(&self.origin_from(headers, peer)).unwrap_or_else(|_| self.rp_id.clone())
     }
 
     pub fn webauthn_from(
         &self,
         headers: &HeaderMap,
+        peer: Option<SocketAddr>,
     ) -> Result<Webauthn, Box<dyn std::error::Error>> {
-        let origin = self.origin_from(headers);
+        let origin = self.origin_from(headers, peer);
         let rp_id = rp_id_for_origin(&origin)?;
         let url = Url::parse(&origin)?;
         Ok(WebauthnBuilder::new(&rp_id, &url)?
@@ -97,13 +110,17 @@ impl AuthState {
     }
 }
 
-pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
+/// Honor `X-Forwarded-Proto` only from loopback peers (same rule as rate-limit IP).
+pub fn trust_forwarded_proto(peer: Option<SocketAddr>) -> bool {
+    trust_proxy() && peer.map(|p| p.ip().is_loopback()).unwrap_or(false)
+}
+
+pub fn public_origin(headers: &HeaderMap, fallback: &str, peer: Option<SocketAddr>) -> String {
     if let Ok(forced) = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN") {
         if !forced.is_empty() {
             return forced.trim_end_matches('/').to_string();
         }
     }
-    let trust = trust_proxy();
     // Never honor client-controlled X-Forwarded-Host for cookie/WebAuthn origin.
     // Reverse proxies should set Host to the public hostname; pin
     // TESLAMATE_RS_WEBAUTHN_ORIGIN when that is not reliable.
@@ -113,7 +130,7 @@ pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
         .and_then(|s| s.split(',').next())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let proto = if trust {
+    let proto = if trust_forwarded_proto(peer) {
         headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
@@ -417,11 +434,12 @@ pub fn issue_session(
     db: &Db,
     user_id: i64,
     headers: &HeaderMap,
+    peer: Option<SocketAddr>,
 ) -> Result<CookieJar, Box<dyn std::error::Error>> {
     let token = random_token();
     let conn = db.lock();
     users::create_session(&conn, user_id, &token)?;
-    Ok(jar.add(state.session_cookie(&token, headers)))
+    Ok(jar.add(state.session_cookie(&token, headers, peer)))
 }
 
 #[allow(dead_code)]
@@ -513,11 +531,12 @@ mod tests {
         // Nginx should pass the public Host; X-Forwarded-Host alone is ignored.
         headers.insert(header::HOST, "tm.example.com".parse().unwrap());
         headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
-        let origin = public_origin(&headers, "http://localhost:4010");
+        let peer: SocketAddr = "127.0.0.1:4010".parse().unwrap();
+        let origin = public_origin(&headers, "http://localhost:4010", Some(peer));
         assert_eq!(origin, "https://tm.example.com");
         let state = AuthState::new("localhost", "http://localhost:4010").unwrap();
-        assert!(state.secure_from(&headers));
-        assert_eq!(state.rp_id_from(&headers), "tm.example.com");
+        assert!(state.secure_from(&headers, Some(peer)));
+        assert_eq!(state.rp_id_from(&headers, Some(peer)), "tm.example.com");
         match prev_trust {
             Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
             None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
@@ -539,9 +558,35 @@ mod tests {
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
         headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
+        let peer: SocketAddr = "127.0.0.1:4010".parse().unwrap();
         assert_eq!(
-            public_origin(&headers, "http://localhost:4010"),
+            public_origin(&headers, "http://localhost:4010", Some(peer)),
             "https://127.0.0.1:4010"
+        );
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
+    }
+
+    #[test]
+    fn forwarded_proto_ignored_from_non_loopback_peer() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert(header::HOST, "tm.example.com".parse().unwrap());
+        let peer: SocketAddr = "192.0.2.1:4010".parse().unwrap();
+        assert_eq!(
+            public_origin(&headers, "http://localhost:4010", Some(peer)),
+            "http://tm.example.com"
         );
         match prev_trust {
             Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
@@ -565,7 +610,7 @@ mod tests {
         headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
         headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
         assert_eq!(
-            public_origin(&headers, "http://localhost:4010"),
+            public_origin(&headers, "http://localhost:4010", None),
             "http://127.0.0.1:4010"
         );
         match prev_trust {
@@ -587,7 +632,7 @@ mod tests {
         headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         headers.insert(header::HOST, "mate.lan".parse().unwrap());
         assert_eq!(
-            public_origin(&headers, "http://localhost:4010"),
+            public_origin(&headers, "http://localhost:4010", None),
             "http://mate.lan"
         );
         match prev_origin {

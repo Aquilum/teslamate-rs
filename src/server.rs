@@ -3,7 +3,7 @@ use crate::auth::{AdminUser, AuthState, AuthUser, PasswordBackend};
 use crate::db::Db;
 use crate::sql::{self, QueryVars};
 use anyhow::Result;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -172,7 +172,7 @@ fn csrf_origin_ok(headers: &axum::http::HeaderMap) -> bool {
             return false;
         }
     }
-    let expected = crate::auth::public_origin(headers, "");
+    let expected = crate::auth::public_origin(headers, "", None);
     if expected.is_empty() {
         return true;
     }
@@ -194,7 +194,11 @@ fn origin_matches(origin: &str, expected: &str) -> bool {
 }
 
 async fn security_headers(req: Request, next: Next) -> Response {
-    let https = request_is_https(&req);
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let https = request_is_https(req.headers(), peer);
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
@@ -219,18 +223,14 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
-fn request_is_https(req: &Request) -> bool {
+fn request_is_https(headers: &axum::http::HeaderMap, peer: Option<SocketAddr>) -> bool {
     if let Ok(origin) = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN") {
         if origin.starts_with("https://") {
             return true;
         }
     }
-    if req.uri().scheme_str() == Some("https") {
-        return true;
-    }
-    if crate::auth::trust_proxy() {
-        return req
-            .headers()
+    if crate::auth::trust_forwarded_proto(peer) {
+        return headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.split(',').next())
@@ -238,6 +238,22 @@ fn request_is_https(req: &Request) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case("https"));
     }
     false
+}
+
+/// Reject traversal tricks before rust-embed lookups.
+pub fn safe_embed_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
+}
+
+fn dashboard_path_allowed(path: &str) -> bool {
+    safe_embed_path(path) && path.ends_with(".json") && !path.starts_with("internal/")
 }
 
 async fn index() -> impl IntoResponse {
@@ -252,6 +268,9 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn static_file(Path(path): Path<String>) -> Response {
+    if !safe_embed_path(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match Web::get(&path) {
         Some(f) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
@@ -396,6 +415,9 @@ async fn list_dashboards(_user: AuthUser) -> Json<Vec<DashMeta>> {
 }
 
 async fn get_dashboard(_user: AuthUser, Path(path): Path<String>) -> Response {
+    if !dashboard_path_allowed(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match Dashboards::get(&path) {
         Some(f) => (
             [(header::CONTENT_TYPE, "application/json")],
@@ -643,6 +665,18 @@ async fn run_query(
     State(app): State<App>,
     Json(body): Json<QueryBody>,
 ) -> Result<Response, AppError> {
+    let rate_key = format!("query:{}", user.id);
+    if !app.limiter.allow_budget(
+        &rate_key,
+        crate::app_state::query_rate_max(),
+        crate::app_state::query_rate_window(),
+    ) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "ok": false, "error": "query rate limit exceeded" })),
+        )
+            .into_response());
+    }
     let _permits = match app.query_gate.try_acquire(user.id).await {
         Ok(p) => p,
         Err(()) => {
@@ -852,6 +886,19 @@ mod query_cancel_tests {
             Some("admin".into()),
         );
         assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn embed_paths_reject_traversal() {
+        assert!(safe_embed_path("app.js"));
+        assert!(safe_embed_path("reports/dutch-tax.json"));
+        assert!(!safe_embed_path(""));
+        assert!(!safe_embed_path("/app.js"));
+        assert!(!safe_embed_path("../index.html"));
+        assert!(!safe_embed_path("foo/../bar.json"));
+        assert!(dashboard_path_allowed("overview.json"));
+        assert!(!dashboard_path_allowed("internal/hidden.json"));
+        assert!(!dashboard_path_allowed("overview.json/.."));
     }
 }
 
