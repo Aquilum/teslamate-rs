@@ -9,7 +9,7 @@ use crate::auth::{
 use crate::users::{self, User};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::Deserialize;
@@ -30,6 +30,7 @@ pub fn router() -> Router<App> {
         .route("/api/auth/webauthn/login/finish", post(wa_login_finish))
         .route("/api/auth/passkeys", get(list_passkeys))
         .route("/api/auth/passkeys/{id}", delete(delete_passkey))
+        .route("/api/account/layout", put(set_layout))
         .route("/api/admin/invites", get(list_invites).post(create_invite))
 }
 
@@ -93,9 +94,11 @@ async fn auth_status(
         },
     });
     if let Some(user) = user.0 {
-        let passkeys = {
+        let (passkeys, ui_layout) = {
             let conn = app.db.lock();
-            users::list_passkeys(&conn, user.id).map_err(internal_err)?
+            let passkeys = users::list_passkeys(&conn, user.id).map_err(internal_err)?;
+            let ui_layout = users::ui_layout(&conn, user.id).map_err(internal_err)?;
+            (passkeys, ui_layout)
         };
         body["user"] = json!({
             "id": user.id,
@@ -103,6 +106,7 @@ async fn auth_status(
             "isAdmin": user.is_admin,
         });
         body["passkeys"] = serde_json::to_value(passkeys).unwrap_or(json!([]));
+        body["uiLayout"] = json!(ui_layout);
     }
     Ok(Json(body))
 }
@@ -542,6 +546,32 @@ fn apply_auth_result(
         }
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct LayoutBody {
+    #[serde(rename = "uiLayout")]
+    ui_layout: String,
+}
+
+async fn set_layout(
+    State(app): State<App>,
+    user: AuthUser,
+    Json(body): Json<LayoutBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let layout = {
+        let conn = app.db.lock();
+        users::set_ui_layout(&conn, user.id, &body.ui_layout).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("ui layout") {
+                api_err(StatusCode::BAD_REQUEST, msg)
+            } else {
+                internal_err(msg)
+            }
+        })?;
+        users::ui_layout(&conn, user.id).map_err(internal_err)?
+    };
+    Ok(Json(json!({ "ok": true, "uiLayout": layout })))
 }
 
 async fn list_passkeys(

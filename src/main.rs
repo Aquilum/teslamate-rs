@@ -4,6 +4,7 @@ mod auth_http;
 mod db;
 mod import;
 mod invoices;
+mod live;
 mod logger;
 mod mock;
 mod pam_auth;

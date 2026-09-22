@@ -407,6 +407,36 @@ pub fn peek_invite(conn: &Connection, token: &str) -> Result<Option<i64>, Box<dy
         .optional()?)
 }
 
+pub fn ui_layout(conn: &Connection, user_id: i64) -> Result<String, Box<dyn std::error::Error>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT ui_layout FROM user_prefs WHERE user_id=?1",
+            [user_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match stored.as_deref() {
+        Some("grouped") => "grouped".into(),
+        _ => "classic".into(),
+    })
+}
+
+pub fn set_ui_layout(
+    conn: &Connection,
+    user_id: i64,
+    layout: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if layout != "classic" && layout != "grouped" {
+        return Err("ui layout must be classic or grouped".into());
+    }
+    conn.execute(
+        "INSERT INTO user_prefs (user_id, ui_layout) VALUES (?1, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET ui_layout = excluded.ui_layout",
+        params![user_id, layout],
+    )?;
+    Ok(())
+}
+
 pub fn consume_invite(
     conn: &Connection,
     token: &str,
@@ -446,6 +476,18 @@ mod tests {
         let guest = insert_user_with_invite(&conn, "guest", Some("hash"), token, None).unwrap();
         assert!(!guest.is_admin);
         assert!(insert_user_with_invite(&conn, "late", Some("hash"), token, None).is_err());
+    }
+
+    #[test]
+    fn layout_is_per_account() {
+        let conn = mem();
+        let a = insert_user(&conn, "ada", Some("hash"), true).unwrap();
+        let b = insert_user(&conn, "bea", Some("hash"), false).unwrap();
+        assert_eq!(ui_layout(&conn, a.id).unwrap(), "classic");
+        set_ui_layout(&conn, a.id, "grouped").unwrap();
+        assert!(set_ui_layout(&conn, a.id, "grafana").is_err());
+        assert_eq!(ui_layout(&conn, a.id).unwrap(), "grouped");
+        assert_eq!(ui_layout(&conn, b.id).unwrap(), "classic");
     }
 
     #[test]

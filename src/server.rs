@@ -71,6 +71,7 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         .route("/", get(index))
         .route("/api/health", get(health))
         .route("/api/cars", get(cars))
+        .route("/api/cars/{id}/live", get(car_live))
         .route("/api/settings", get(settings))
         .route("/api/dashboards", get(list_dashboards))
         .route("/api/dashboards/{*path}", get(get_dashboard))
@@ -171,6 +172,18 @@ async fn cars(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, Ap
         Ok(Json(json!(rows)))
     })
     .await
+}
+
+async fn car_live(
+    _user: AuthUser,
+    State(app): State<App>,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    let view = spawn_db(app.db.clone(), move |conn| crate::live::live_view(conn, id)).await?;
+    Ok(match view {
+        Some(v) => Json(v).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
 }
 
 async fn settings(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
