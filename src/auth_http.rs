@@ -3,7 +3,7 @@
 use crate::app_state::App;
 use crate::auth::{
     self, api_err, hash_password, internal_err, issue_session, normalize_username, pam_provision_user,
-    passkeys_of, session_token_from_jar, store_passkey, update_stored_passkey, verify_password,
+    passkeys_of, session_token_from_jar, store_passkey, update_stored_passkey, verify_password_or_dummy,
     AdminUser, AuthUser, OptionalUser, PasswordBackend, WA_COOKIE,
 };
 use crate::users::{self, User};
@@ -237,18 +237,17 @@ async fn auth_login(
         let conn = app.db.lock();
         users::get_user_by_username(&conn, &username).map_err(internal_err)?
     };
-    let Some(user) = user else {
-        crate::audit::record(&app.db, Some(&username), "login_failed", "unknown user");
-        return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
-    };
-    let Some(hash) = user.password_hash.as_deref() else {
-        crate::audit::record(&app.db, Some(&username), "login_failed", "no password");
-        return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
-    };
-    if !verify_password(&password, hash) {
-        crate::audit::record(&app.db, Some(&username), "login_failed", "bad password");
+    let hash = user.as_ref().and_then(|u| u.password_hash.as_deref());
+    if !verify_password_or_dummy(&password, hash) {
+        let detail = match &user {
+            None => "unknown user",
+            Some(u) if u.password_hash.is_none() => "no password",
+            _ => "bad password",
+        };
+        crate::audit::record(&app.db, Some(&username), "login_failed", detail);
         return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
     }
+    let user = user.expect("verify_password_or_dummy requires a stored hash");
     let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
     crate::audit::record(&app.db, Some(&user.username), "login", "local");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))

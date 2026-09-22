@@ -419,6 +419,11 @@ pub fn hash_password(password: &str) -> Result<String, Box<dyn std::error::Error
         .to_string())
 }
 
+/// Argon2id hash of a fixed dummy password (salt `teslamate-rs-dummy!!`).
+/// Used so unknown-user / passkey-only logins still pay the verify cost.
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$dGVzbGFtYXRlLXJzLWR1bW15ISE$PCo3YFlzCkMv+knY186or6Uk3ov0icPGI4sD7wABr6Q";
+
 pub fn verify_password(password: &str, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
@@ -426,6 +431,13 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()
+}
+
+/// Always runs Argon2 verify (against `hash` or a dummy) so callers cannot
+/// distinguish missing users from bad passwords via response timing.
+pub fn verify_password_or_dummy(password: &str, hash: Option<&str>) -> bool {
+    let effective = hash.unwrap_or(DUMMY_PASSWORD_HASH);
+    verify_password(password, effective) && hash.is_some()
 }
 
 pub fn issue_session(
@@ -507,6 +519,17 @@ mod tests {
         let hash = hash_password("correct horse").unwrap();
         assert!(verify_password("correct horse", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn login_verify_always_checks_argon2() {
+        assert!(!verify_password_or_dummy("anything1", None));
+        let hash = hash_password("correct horse").unwrap();
+        assert!(verify_password_or_dummy("correct horse", Some(&hash)));
+        assert!(!verify_password_or_dummy("wrong pass", Some(&hash)));
+        // Dummy hash must itself be a valid Argon2 PHC string.
+        assert!(PasswordHash::new(DUMMY_PASSWORD_HASH).is_ok());
+        assert!(!verify_password("correct horse", DUMMY_PASSWORD_HASH));
     }
 
     #[test]

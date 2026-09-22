@@ -171,11 +171,13 @@ pub fn insert_user_with_invite(
     uuid: Option<&str>,
 ) -> Result<User, Box<dyn std::error::Error>> {
     with_immediate(conn, || {
-        if get_user_by_username(conn, username)?.is_some() {
-            return Err("username is taken".into());
-        }
+        // Validate the invite before revealing whether a username exists — otherwise
+        // unauthenticated callers can probe accounts with any garbage invite token.
         if peek_invite(conn, invite)?.is_none() {
             return Err("invite is invalid or expired".into());
+        }
+        if get_user_by_username(conn, username)?.is_some() {
+            return Err("username is taken".into());
         }
         let user = insert_user_with_uuid(conn, username, password_hash, false, uuid)?;
         if !consume_invite(conn, invite, user.id)? {
@@ -510,6 +512,35 @@ mod tests {
         let guest = insert_user_with_invite(&conn, "guest", Some("hash"), token, None).unwrap();
         assert!(!guest.is_admin);
         assert!(insert_user_with_invite(&conn, "late", Some("hash"), token, None).is_err());
+    }
+
+    #[test]
+    fn register_hides_usernames_without_valid_invite() {
+        let conn = mem();
+        let admin = create_first_admin(&conn, "admin", Some("hash"), None).unwrap();
+        insert_user(&conn, "alice", Some("hash"), false).unwrap();
+        let err_taken = insert_user_with_invite(&conn, "alice", Some("hash"), "bogus", None)
+            .unwrap_err()
+            .to_string();
+        let err_fresh = insert_user_with_invite(&conn, "bob", Some("hash"), "bogus", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_taken.contains("invite"),
+            "existing user must not leak via bad invite: {err_taken}"
+        );
+        assert!(
+            err_fresh.contains("invite"),
+            "unknown user must not differ from existing: {err_fresh}"
+        );
+        assert_eq!(err_taken, err_fresh);
+
+        let token = "real-invite";
+        create_invite(&conn, admin.id, token).unwrap();
+        let taken = insert_user_with_invite(&conn, "alice", Some("hash"), token, None)
+            .unwrap_err()
+            .to_string();
+        assert!(taken.contains("taken"), "{taken}");
     }
 
     #[test]
