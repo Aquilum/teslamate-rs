@@ -1468,14 +1468,19 @@ function drawBarChart(el, panel, cols, rows) {
       .join("")}</div>`;
 }
 
+function osmTiles() {
+  return L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OSM",
+    maxZoom: 19,
+    errorTileUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+  });
+}
+
 function ensureRouteMap(el) {
   if (el._tmMap) return el._tmMap;
   el.innerHTML = "";
   const map = L.map(el).setView([54, -2], 6);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    attribution: "&copy; OSM",
-    maxZoom: 19,
-  }).addTo(map);
+  osmTiles().addTo(map);
   const g = { map, line: null, fitted: false };
   el._tmMap = g;
   return g;
@@ -1490,10 +1495,7 @@ function drawGeomap(el, panel, cols, rows, opts = {}) {
       el._tmMap = null;
     }
     const map = L.map(el).setView([54, -2], 6);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "&copy; OSM",
-      maxZoom: 19,
-    }).addTo(map);
+    osmTiles().addTo(map);
     const latKey = cols.find((c) => /lat/i.test(c));
     const lonKey = cols.find((c) => /lon|lng/i.test(c));
     const pts = [];
@@ -2084,10 +2086,7 @@ function paintLive(host, data) {
   const lon = Number(d.lon);
   if (mapEl && Number.isFinite(lat) && Number.isFinite(lon) && !(lat === 0 && lon === 0)) {
     const map = L.map(mapEl, { zoomControl: false }).setView([lat, lon], 13);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "&copy; OSM",
-      maxZoom: 19,
-    }).addTo(map);
+    osmTiles().addTo(map);
     L.circleMarker([lat, lon], { radius: 8, color: "#e85d04", fillOpacity: 0.85, weight: 1 }).addTo(map);
     mapEl._map = map;
     requestAnimationFrame(() => map.invalidateSize());
@@ -2181,12 +2180,13 @@ function mountPath(el, path) {
     return;
   }
   const map = L.map(el, { zoomControl: false, attributionControl: false });
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+  osmTiles().addTo(map);
   let line = null;
   if (pts.length === 1) {
     L.circleMarker(pts[0], { radius: 7, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 0.9, weight: 1 }).addTo(map);
   } else {
-    line = L.polyline(pts, { color: "#e85d04", weight: 3, opacity: 0.95 }).addTo(map);
+    L.polyline(pts, { color: "#111217", weight: 7, opacity: 0.9 }).addTo(map);
+    line = L.polyline(pts, { color: "#e85d04", weight: 3, opacity: 1 }).addTo(map);
     L.circleMarker(pts[0], { radius: 4, color: "#d8dde8", fillColor: "#d8dde8", fillOpacity: 1, weight: 0 }).addTo(map);
     L.circleMarker(pts[pts.length - 1], { radius: 6, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 1, weight: 0 }).addTo(map);
   }
