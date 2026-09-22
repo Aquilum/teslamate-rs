@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
 const QUERY_CACHE_MAX: usize = 128;
@@ -194,6 +195,80 @@ impl AuthLimiter {
     }
 }
 
+const DEFAULT_QUERY_PER_USER: usize = 4;
+const DEFAULT_QUERY_GLOBAL: usize = 32;
+const QUERY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn query_per_user_limit() -> usize {
+    std::env::var("TESLAMATE_RS_QUERY_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_PER_USER)
+        .clamp(1, 64)
+}
+
+fn query_global_limit() -> usize {
+    std::env::var("TESLAMATE_RS_QUERY_GLOBAL_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_GLOBAL)
+        .clamp(1, 256)
+}
+
+/// Caps in-flight `/api/query` work so one account cannot exhaust the SQLite
+/// read pool / blocking thread pool.
+#[derive(Clone)]
+pub struct QueryGate {
+    global: Arc<Semaphore>,
+    per_user: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
+    per_user_limit: usize,
+}
+
+pub struct QueryPermits {
+    _user: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
+impl Default for QueryGate {
+    fn default() -> Self {
+        Self::new(query_global_limit(), query_per_user_limit())
+    }
+}
+
+impl QueryGate {
+    pub fn new(global: usize, per_user: usize) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(global.max(1))),
+            per_user: Arc::new(Mutex::new(HashMap::new())),
+            per_user_limit: per_user.max(1),
+        }
+    }
+
+    fn user_semaphore(&self, user_id: i64) -> Arc<Semaphore> {
+        let mut map = self.per_user.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(user_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_user_limit)))
+            .clone()
+    }
+
+    /// Acquire per-user then global permits, or fail after a short wait (429).
+    pub async fn try_acquire(&self, user_id: i64) -> Result<QueryPermits, ()> {
+        let user_sem = self.user_semaphore(user_id);
+        let user = tokio::time::timeout(QUERY_ACQUIRE_TIMEOUT, user_sem.acquire_owned())
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let global = tokio::time::timeout(QUERY_ACQUIRE_TIMEOUT, self.global.clone().acquire_owned())
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        Ok(QueryPermits {
+            _user: user,
+            _global: global,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub db: Db,
@@ -201,6 +276,7 @@ pub struct App {
     pub password_backend: PasswordBackend,
     pub limiter: AuthLimiter,
     pub query_cache: QueryCache,
+    pub query_gate: QueryGate,
     /// First-admin setup is allowed (loopback bind or TESLAMATE_RS_ALLOW_SETUP=1).
     pub setup_allowed: bool,
 }
@@ -241,5 +317,29 @@ mod tests {
         assert_eq!(top["rows"][0]["Calls"], json!(1));
         let reset = cache.grafana_statements("reset");
         assert!(reset["rows"][0]["stats_reset"].as_str().unwrap().contains("UTC"));
+    }
+
+    #[tokio::test]
+    async fn query_gate_rejects_over_per_user_limit() {
+        let gate = QueryGate::new(32, 2);
+        let a = gate.try_acquire(7).await.expect("first");
+        let b = gate.try_acquire(7).await.expect("second");
+        let blocked = gate.try_acquire(7).await;
+        assert!(blocked.is_err(), "third concurrent query for same user");
+        // Other users still get a slot.
+        let other = gate.try_acquire(8).await.expect("other user");
+        drop(a);
+        drop(b);
+        drop(other);
+        gate.try_acquire(7).await.expect("after release");
+    }
+
+    #[tokio::test]
+    async fn query_gate_rejects_over_global_limit() {
+        let gate = QueryGate::new(1, 8);
+        let a = gate.try_acquire(1).await.expect("first");
+        assert!(gate.try_acquire(2).await.is_err());
+        drop(a);
+        gate.try_acquire(2).await.expect("after release");
     }
 }

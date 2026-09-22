@@ -25,6 +25,7 @@ pub fn router() -> Router<App> {
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/logout-all", post(auth_logout_all))
         .route("/api/auth/webauthn/register/start", post(wa_register_start))
         .route("/api/auth/webauthn/register/finish", post(wa_register_finish))
         .route("/api/auth/webauthn/login/start", post(wa_login_start))
@@ -260,6 +261,28 @@ async fn auth_logout(
     Ok((
         jar.remove(app.auth.session_cookie_key(&headers)),
         Json(json!({ "ok": true })),
+    ))
+}
+
+async fn auth_logout_all(
+    user: AuthUser,
+    State(app): State<App>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
+    let n = {
+        let conn = app.db.lock();
+        users::delete_sessions_for_user(&conn, user.id).map_err(internal_err)?
+    };
+    crate::audit::record(
+        &app.db,
+        Some(&user.username),
+        "logout_all",
+        &format!("revoked {n} session(s)"),
+    );
+    Ok((
+        jar.remove(app.auth.session_cookie_key(&headers)),
+        Json(json!({ "ok": true, "revoked": n })),
     ))
 }
 

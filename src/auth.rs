@@ -104,22 +104,15 @@ pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
         }
     }
     let trust = trust_proxy();
-    let host = if trust {
-        headers
-            .get("x-forwarded-host")
-            .or_else(|| headers.get(header::HOST))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    } else {
-        headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    };
+    // Never honor client-controlled X-Forwarded-Host for cookie/WebAuthn origin.
+    // Reverse proxies should set Host to the public hostname; pin
+    // TESLAMATE_RS_WEBAUTHN_ORIGIN when that is not reliable.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let proto = if trust {
         headers
             .get("x-forwarded-proto")
@@ -517,13 +510,39 @@ mod tests {
         std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "tm.example.com".parse().unwrap());
-        headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
+        // Nginx should pass the public Host; X-Forwarded-Host alone is ignored.
+        headers.insert(header::HOST, "tm.example.com".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
         let origin = public_origin(&headers, "http://localhost:4010");
         assert_eq!(origin, "https://tm.example.com");
         let state = AuthState::new("localhost", "http://localhost:4010").unwrap();
         assert!(state.secure_from(&headers));
         assert_eq!(state.rp_id_from(&headers), "tm.example.com");
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
+    }
+
+    #[test]
+    fn forwarded_host_ignored_even_with_trust_proxy() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
+        assert_eq!(
+            public_origin(&headers, "http://localhost:4010"),
+            "https://127.0.0.1:4010"
+        );
         match prev_trust {
             Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
             None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),

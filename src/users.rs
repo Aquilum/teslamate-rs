@@ -187,6 +187,7 @@ pub fn insert_user_with_invite(
 
 const SESSION_DAYS_DEFAULT: i64 = 7;
 const SESSION_IDLE_HOURS_DEFAULT: i64 = 24;
+const SESSION_MAX_PER_USER_DEFAULT: i64 = 10;
 
 pub fn session_days() -> i64 {
     std::env::var("TESLAMATE_RS_SESSION_DAYS")
@@ -204,6 +205,14 @@ pub fn session_idle_hours() -> i64 {
         .clamp(1, 24 * 30)
 }
 
+pub fn session_max_per_user() -> i64 {
+    std::env::var("TESLAMATE_RS_SESSION_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_MAX_PER_USER_DEFAULT)
+        .clamp(1, 100)
+}
+
 pub fn create_session(
     conn: &Connection,
     user_id: i64,
@@ -216,6 +225,15 @@ pub fn create_session(
         "INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_seen)
          VALUES (?1, ?2, ?3, datetime('now'), ?4)",
         params![hash_secret(token), user_id, expires, seen],
+    )?;
+    // Cap concurrent sessions per user (oldest absolute expiry / created first).
+    let max = session_max_per_user();
+    conn.execute(
+        "DELETE FROM sessions WHERE user_id=?1 AND rowid NOT IN (
+            SELECT rowid FROM sessions WHERE user_id=?1
+            ORDER BY created_at DESC, rowid DESC LIMIT ?2
+         )",
+        params![user_id, max],
     )?;
     Ok(())
 }
@@ -262,6 +280,14 @@ pub fn delete_session(conn: &Connection, token: &str) -> Result<(), Box<dyn std:
         [hash_secret(token)],
     )?;
     Ok(())
+}
+
+pub fn delete_sessions_for_user(
+    conn: &Connection,
+    user_id: i64,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let n = conn.execute("DELETE FROM sessions WHERE user_id=?1", [user_id])?;
+    Ok(n)
 }
 
 pub fn store_webauthn_challenge(
@@ -495,5 +521,27 @@ mod tests {
         assert_eq!(got.username, "tom");
         delete_session(&conn, "secret").unwrap();
         assert!(user_from_session(&conn, "secret").unwrap().is_none());
+    }
+
+    #[test]
+    fn session_cap_evicts_oldest() {
+        let conn = mem();
+        let user = insert_user(&conn, "tom", Some("hash"), true).unwrap();
+        let prev = std::env::var("TESLAMATE_RS_SESSION_MAX").ok();
+        std::env::set_var("TESLAMATE_RS_SESSION_MAX", "2");
+        create_session(&conn, user.id, "a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        create_session(&conn, user.id, "b").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        create_session(&conn, user.id, "c").unwrap();
+        match prev {
+            Some(v) => std::env::set_var("TESLAMATE_RS_SESSION_MAX", v),
+            None => std::env::remove_var("TESLAMATE_RS_SESSION_MAX"),
+        }
+        assert!(user_from_session(&conn, "a").unwrap().is_none());
+        assert!(user_from_session(&conn, "b").unwrap().is_some());
+        assert!(user_from_session(&conn, "c").unwrap().is_some());
+        assert_eq!(delete_sessions_for_user(&conn, user.id).unwrap(), 2);
+        assert!(user_from_session(&conn, "c").unwrap().is_none());
     }
 }

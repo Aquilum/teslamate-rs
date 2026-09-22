@@ -256,6 +256,10 @@ document.getElementById("logout-btn").onclick = async () => {
   await authJson("/api/auth/logout", { method: "POST", body: {} });
   await boot();
 };
+document.getElementById("logout-all-btn").onclick = async () => {
+  await authJson("/api/auth/logout-all", { method: "POST", body: {} });
+  await boot();
+};
 document.getElementById("add-passkey").onclick = async () => {
   try {
     await waRegister();

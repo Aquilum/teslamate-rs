@@ -510,7 +510,7 @@ mod tests {
     fn strips_html_metacharacters_from_vehicle_names() {
         assert_eq!(
             sanitize_vehicle_name(r#"</option><img src=x onerror=alert(1)>"#),
-            "/optionimg src=x onerror=alert(1)/"
+            "/optionimg src=x onerror=alert(1)"
         );
         assert_eq!(sanitize_vehicle_name("  Red S  "), "Red S");
         assert_eq!(sanitize_vehicle_name("<<<"), "Vehicle");

@@ -35,7 +35,7 @@ sudo systemctl enable --now teslamate-rs
 - `root` cannot sign in unless `TESLAMATE_RS_PAM_ALLOW_ROOT=1`.
 - `TESLAMATE_RS_AUTH=local` or `--auth local` restores the SQLite password database.
 
-On a **Linux host**, keep teslamate-rs on loopback and put **nginx TLS** in front so session cookies are `Secure` and passkeys match the public hostname. See `docs/nginx-teslamate-rs.conf`. Set `TESLAMATE_RS_TRUST_PROXY=1` and pin origin with `TESLAMATE_RS_WEBAUTHN_ORIGIN` / `TESLAMATE_RS_WEBAUTHN_RP_ID`. Forwarded headers are ignored unless trust-proxy (or a pinned origin) is enabled.
+On a **Linux host**, keep teslamate-rs on loopback and put **nginx TLS** in front so session cookies are `Secure` and passkeys match the public hostname. See `docs/nginx-teslamate-rs.conf`. Set `TESLAMATE_RS_TRUST_PROXY=1` and pin origin with `TESLAMATE_RS_WEBAUTHN_ORIGIN` / `TESLAMATE_RS_WEBAUTHN_RP_ID`. With trust-proxy, `X-Forwarded-Proto` / `X-Real-IP` are honored from loopback peers; `X-Forwarded-Host` is ignored (set `Host` to the public name, or pin the WebAuthn origin).
 
 Owner API tokens in SQLite are encrypted at rest (`TESLAMATE_RS_TOKEN_KEY`, `TESLAMATE_RS_TOKEN_KEY_FILE`, `/etc/teslamate-rs/oauth.key`, or `$TESLAMATE_RS_HOME/secrets/oauth.key`). Dashboard `/api/query` only accepts embedded Grafana SQL templates (plus the geomap preview), is SELECT-only, and cannot read auth/token tables. `/api/dbinfo` is admin-only. First-admin setup on a non-loopback bind requires `TESLAMATE_RS_ALLOW_SETUP=1`.
 

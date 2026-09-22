@@ -1,4 +1,4 @@
-use crate::app_state::{App, AuthLimiter, QueryCache};
+use crate::app_state::{App, AuthLimiter, QueryCache, QueryGate};
 use crate::auth::{AdminUser, AuthState, AuthUser, PasswordBackend};
 use crate::db::Db;
 use crate::sql::{self, QueryVars};
@@ -109,6 +109,7 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         password_backend,
         limiter: AuthLimiter::default(),
         query_cache: QueryCache::default(),
+        query_gate: QueryGate::default(),
         setup_allowed,
     };
     let app = Router::new()
@@ -193,6 +194,7 @@ fn origin_matches(origin: &str, expected: &str) -> bool {
 }
 
 async fn security_headers(req: Request, next: Next) -> Response {
+    let https = request_is_https(&req);
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
@@ -208,7 +210,34 @@ async fn security_headers(req: Request, next: Next) -> Response {
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
         ),
     );
+    if https {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
     res
+}
+
+fn request_is_https(req: &Request) -> bool {
+    if let Ok(origin) = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN") {
+        if origin.starts_with("https://") {
+            return true;
+        }
+    }
+    if req.uri().scheme_str() == Some("https") {
+        return true;
+    }
+    if crate::auth::trust_proxy() {
+        return req
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    }
+    false
 }
 
 async fn index() -> impl IntoResponse {
@@ -613,7 +642,17 @@ async fn run_query(
     user: AuthUser,
     State(app): State<App>,
     Json(body): Json<QueryBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
+    let _permits = match app.query_gate.try_acquire(user.id).await {
+        Ok(p) => p,
+        Err(()) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "ok": false, "error": "too many queries" })),
+            )
+                .into_response());
+        }
+    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(cancelled.clone());
     let db = app.db.clone();
@@ -627,7 +666,7 @@ async fn run_query(
     })
     .await
     .map_err(|e| AppError(anyhow::anyhow!("query task: {e}")))?;
-    Ok(Json(payload))
+    Ok(Json(payload).into_response())
 }
 
 fn sqlite_to_json(v: ValueRef) -> Value {
