@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const INVITE_DAYS: i64 = 7;
 const WEBAUTHN_MINUTES: i64 = 10;
+const INVITE_UNUSED_MAX_DEFAULT: i64 = 20;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -427,11 +428,36 @@ pub fn delete_passkey(
     Ok(n > 0)
 }
 
+pub fn invite_unused_max() -> i64 {
+    std::env::var("TESLAMATE_RS_INVITE_UNUSED_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(INVITE_UNUSED_MAX_DEFAULT)
+        .clamp(1, 200)
+}
+
+pub fn count_unused_invites(conn: &Connection) -> Result<i64, Box<dyn std::error::Error>> {
+    let now = Utc::now().to_rfc3339();
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM invites WHERE used_by IS NULL AND expires_at >= ?1",
+        [&now],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn create_invite(
     conn: &Connection,
     created_by: i64,
     token: &str,
 ) -> Result<InviteInfo, Box<dyn std::error::Error>> {
+    let unused = count_unused_invites(conn)?;
+    let max = invite_unused_max();
+    if unused >= max {
+        return Err(format!(
+            "too many unused invites ({unused}); redeem or wait for expiry (max {max})"
+        )
+        .into());
+    }
     let expires = (Utc::now() + Duration::days(INVITE_DAYS)).to_rfc3339();
     conn.execute(
         "INSERT INTO invites (token_hash, created_by, expires_at, created_at)
@@ -574,5 +600,24 @@ mod tests {
         assert!(user_from_session(&conn, "c").unwrap().is_some());
         assert_eq!(delete_sessions_for_user(&conn, user.id).unwrap(), 2);
         assert!(user_from_session(&conn, "c").unwrap().is_none());
+    }
+
+    #[test]
+    fn unused_invite_cap_blocks_minting() {
+        let conn = mem();
+        let admin = create_first_admin(&conn, "admin", Some("hash"), None).unwrap();
+        let prev = std::env::var("TESLAMATE_RS_INVITE_UNUSED_MAX").ok();
+        std::env::set_var("TESLAMATE_RS_INVITE_UNUSED_MAX", "2");
+        create_invite(&conn, admin.id, "one").unwrap();
+        create_invite(&conn, admin.id, "two").unwrap();
+        let err = create_invite(&conn, admin.id, "three")
+            .unwrap_err()
+            .to_string();
+        match prev {
+            Some(v) => std::env::set_var("TESLAMATE_RS_INVITE_UNUSED_MAX", v),
+            None => std::env::remove_var("TESLAMATE_RS_INVITE_UNUSED_MAX"),
+        }
+        assert!(err.contains("too many unused"), "{err}");
+        assert_eq!(count_unused_invites(&conn).unwrap(), 2);
     }
 }

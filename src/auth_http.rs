@@ -674,11 +674,29 @@ async fn list_invites(admin: AdminUser, State(app): State<App>) -> Result<Json<V
 async fn create_invite(
     admin: AdminUser,
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Bound invite minting even for admins (stolen session / buggy UI).
+    rate_limit(&app, &headers, Some(peer))?;
+    let key = format!("invite:{}", admin.id);
+    if !app.limiter.allow_budget(&key, 30, std::time::Duration::from_secs(15 * 60)) {
+        return Err(api_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many invites, try later",
+        ));
+    }
     let token = auth::random_token();
     let info = {
         let conn = app.db.lock();
-        users::create_invite(&conn, admin.id, &token).map_err(internal_err)?
+        users::create_invite(&conn, admin.id, &token).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("too many unused") {
+                api_err(StatusCode::TOO_MANY_REQUESTS, msg)
+            } else {
+                internal_err(msg)
+            }
+        })?
     };
     crate::audit::record(
         &app.db,

@@ -178,6 +178,14 @@ fn safe_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_') && s.len() <= 64
 }
 
+/// Double-quote a SQLite identifier after validating it is a safe ASCII name.
+pub fn quote_ident(name: &str) -> Option<String> {
+    if !safe_ident(name) {
+        return None;
+    }
+    Some(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
 fn sanitize_extra_value(key: &str, raw: &str) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t.len() > 64 {
@@ -1864,6 +1872,16 @@ mod tests {
         assert!(assert_safe_dashboard_sql("WITH u AS (SELECT * FROM users) SELECT * FROM u").is_err());
         assert!(assert_safe_dashboard_sql("DELETE FROM positions").is_err());
         assert!(assert_safe_dashboard_sql("ATTACH DATABASE '/tmp/x' AS x").is_err());
+    }
+
+    #[test]
+    fn quote_ident_rejects_unsafe_names() {
+        assert_eq!(quote_ident("cars").as_deref(), Some("\"cars\""));
+        assert_eq!(quote_ident("oauth_tokens").as_deref(), Some("\"oauth_tokens\""));
+        assert!(quote_ident("").is_none());
+        assert!(quote_ident("cars; DROP TABLE users").is_none());
+        assert!(quote_ident("1cars").is_none());
+        assert!(quote_ident("car-s").is_none());
     }
 
     #[test]

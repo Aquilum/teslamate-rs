@@ -731,7 +731,14 @@ async fn dbinfo(_admin: AdminUser, State(app): State<App>) -> Result<Json<Value>
             {
                 continue;
             }
-            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |r| r.get(0))?;
+            let Some(quoted) = sql::quote_ident(&name) else {
+                continue;
+            };
+            let n: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM {quoted}"),
+                [],
+                |r| r.get(0),
+            )?;
             tables.push(json!({ "name": name, "rows": n }));
         }
         Ok(Json(json!({
