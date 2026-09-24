@@ -158,10 +158,18 @@ async fn poll_car(
     record_state(db, car_id, state)?;
     match state {
         "asleep" | "offline" => {
+            {
+                let conn = db.lock();
+                crate::live::record_snapshot(&conn, car_id, state, None)?;
+            }
             tokio::time::sleep(Duration::from_secs(asleep_secs(suspend_min))).await;
         }
         "online" => {
             let data = tesla.vehicle_data(vid).await?;
+            {
+                let conn = db.lock();
+                crate::live::record_snapshot(&conn, car_id, state, Some(&data))?;
+            }
             persist_snapshot(db, car_id, &data)?;
             if is_charging(&data) {
                 persist_charge_tick(db, car_id, &data)?;

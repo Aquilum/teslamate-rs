@@ -77,7 +77,14 @@ impl MockCar {
                 "charger_pilot_current": if self.charger_power > 0 { 300 } else { 0 },
                 "charger_phases": 1,
                 "charge_energy_added": self.energy_added,
+                "charge_limit_soc": 80,
+                "time_to_full_charge": if self.charger_power > 0 { 0.4 } else { 0.0 },
+                "minutes_to_full_charge": if self.charger_power > 0 { 24 } else { 0 },
+                "charge_port_door_open": self.charger_power > 0,
+                "scheduled_charging_pending": false,
                 "fast_charger_present": self.charger_power > 20,
+                "fast_charger_brand": if self.charger_power > 20 { "Tesla" } else { "" },
+                "fast_charger_type": if self.charger_power > 20 { "Tesla" } else { "" },
                 "conn_charge_cable": if self.charger_power > 0 { "Tesla Supercharger" } else { "<invalid>" },
                 "battery_heater": false,
                 "battery_heater_on": false,
@@ -90,7 +97,12 @@ impl MockCar {
                 "power": self.power_kw,
                 "shift_state": self.shift,
                 "heading": 85,
-                "native_elevation": 18
+                "native_elevation": 18,
+                "active_route": if self.shift == "D" {
+                    json!({"destination": "Work", "miles_to_arrival": 3.2, "minutes_to_arrival": 12, "energy_at_arrival": 58})
+                } else {
+                    Value::Null
+                }
             },
             "climate_state": {
                 "inside_temp": 20.5,
@@ -98,16 +110,42 @@ impl MockCar {
                 "driver_temp_setting": 21.0,
                 "passenger_temp_setting": 21.0,
                 "is_climate_on": true,
+                "is_preconditioning": false,
+                "climate_keeper_mode": "off",
                 "is_rear_defroster_on": false,
-                "is_front_defroster_on": false
+                "is_front_defroster_on": false,
+                "seat_heater_left": 0,
+                "seat_heater_right": 1,
+                "seat_heater_rear_left": 0,
+                "seat_heater_rear_right": 0,
+                "steering_wheel_heater": false,
+                "cabin_overheat_protection": "On"
             },
             "vehicle_state": {
                 "odometer": self.odo_mi,
                 "car_version": "2026.32.4 abcdef12",
-                "tpms_pressure_fl": 2.9,
-                "tpms_pressure_fr": 2.9,
-                "tpms_pressure_rl": 2.8,
-                "tpms_pressure_rr": 2.8
+                "locked": true,
+                "sentry_mode": self.shift != "D",
+                "is_user_present": self.shift == "D",
+                "valet_mode": false,
+                "df": 0, "dr": 0, "pf": 0, "pr": 0, "ft": 0, "rt": 0,
+                "fd_window": 0, "fp_window": 0, "rd_window": 0, "rp_window": 0,
+                "dashcam_state": "Unavailable",
+                "center_display_state": if self.shift == "D" { 3 } else { 0 },
+                "software_update": {"status": "", "version": ""},
+                "tpms_pressure_fl": 42.0,
+                "tpms_pressure_fr": 42.0,
+                "tpms_pressure_rl": 40.5,
+                "tpms_pressure_rr": 40.5,
+                "tpms_soft_warning_fl": false,
+                "tpms_soft_warning_fr": false,
+                "tpms_soft_warning_rl": false,
+                "tpms_soft_warning_rr": false
+            },
+            "vehicle_config": {
+                "car_type": "models",
+                "exterior_color": "Red",
+                "wheel_type": "Base19"
             }
         })
     }

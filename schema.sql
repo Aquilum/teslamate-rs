@@ -281,6 +281,19 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    ui_layout TEXT NOT NULL DEFAULT 'classic'
+);
+
+CREATE TABLE IF NOT EXISTS vehicle_snapshots (
+    car_id INTEGER PRIMARY KEY REFERENCES cars(id) ON DELETE CASCADE,
+    state TEXT,
+    fetched_at TEXT NOT NULL,
+    detail_at TEXT,
+    data_json TEXT
+);
+
 CREATE TABLE IF NOT EXISTS webauthn_challenges (
     id TEXT PRIMARY KEY,
     purpose TEXT NOT NULL,

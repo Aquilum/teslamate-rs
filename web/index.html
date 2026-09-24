@@ -60,20 +60,31 @@
         <h1 id="title">Overview</h1>
         <div class="controls">
           <label>Car <select id="car"></select></label>
-          <label>From <input type="datetime-local" id="from"></label>
-          <label>To <input type="datetime-local" id="to"></label>
-          <div class="presets">
-            <button data-range="1d">24h</button>
-            <button data-range="7d">7d</button>
-            <button data-range="30d">30d</button>
-            <button data-range="90d">90d</button>
-            <button data-range="1y">1y</button>
-            <button data-range="all">All</button>
+          <div class="range" id="range">
+            <button type="button" class="range-toggle" id="range-toggle" aria-expanded="false" aria-controls="range-panel">30 days</button>
+            <div class="range-panel" id="range-panel">
+              <label>From <input type="datetime-local" id="from"></label>
+              <label>To <input type="datetime-local" id="to"></label>
+              <div class="presets">
+                <button data-range="1d" type="button">24h</button>
+                <button data-range="7d" type="button">7d</button>
+                <button data-range="30d" type="button">30d</button>
+                <button data-range="90d" type="button">90d</button>
+                <button data-range="1y" type="button">1y</button>
+                <button data-range="all" type="button">All</button>
+              </div>
+            </div>
           </div>
           <div class="account" id="account">
             <button type="button" class="ghost who" id="account-btn">Account</button>
             <div class="menu" id="account-menu">
               <p id="account-name"></p>
+              <label class="layout-pick" for="ui-layout">Interface for this account
+                <select id="ui-layout">
+                  <option value="classic">Classic dashboards</option>
+                  <option value="grouped">Grouped</option>
+                </select>
+              </label>
               <div id="passkey-list"></div>
               <div class="auth-actions">
                 <button type="button" id="add-passkey" class="ghost">Add passkey</button>

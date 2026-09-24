@@ -98,6 +98,8 @@ function renderAccount(st) {
     ? u.username + " · admin"
     : u.username || "";
   document.getElementById("invite-btn").hidden = !u.isAdmin || st.passwordBackend === "pam";
+  const layout = document.getElementById("ui-layout");
+  if (layout && st.uiLayout) layout.value = st.uiLayout;
   const keys = st.passkeys || [];
   document.getElementById("passkey-list").innerHTML =
     keys

@@ -2,8 +2,10 @@ mod app_state;
 mod auth;
 mod auth_http;
 mod db;
+mod detail;
 mod import;
 mod invoices;
+mod live;
 mod logger;
 mod mock;
 mod pam_auth;
@@ -22,7 +24,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "teslamate-rs", version, about = "Single-process TeslaMate (Rust + SQLite)")]
+#[command(
+    name = "teslamate-rs",
+    version,
+    about = "Single-process TeslaMate (Rust + SQLite)"
+)]
 struct Cli {
     /// SQLite database path
     #[arg(long, env = "TESLAMATE_RS_DB", global = true)]
@@ -101,12 +107,16 @@ fn point_at_mock(bind: &str, mock_port: u16) {
     let base = format!("http://{bind}:{mock_port}");
     std::env::set_var("TESLA_API_HOST", &base);
     std::env::set_var("TESLA_AUTH_URL", format!("{base}/oauth2/v3/token"));
-    std::env::set_var("TESLA_WSS_HOST", format!("ws://{bind}:{mock_port}/streaming/"));
+    std::env::set_var(
+        "TESLA_WSS_HOST",
+        format!("ws://{bind}:{mock_port}/streaming/"),
+    );
     std::env::set_var("TESLAMATE_RS_POLL_SECS", "1");
 }
 
 async fn probe(db: &db::Db) -> Result<()> {
-    let stored = logger::load_tokens(db)?.ok_or_else(|| anyhow::anyhow!("no tokens; run import-tokens or login"))?;
+    let stored = logger::load_tokens(db)?
+        .ok_or_else(|| anyhow::anyhow!("no tokens; run import-tokens or login"))?;
     let tesla = tesla::Tesla::from_refresh_token(&stored.refresh_token).await?;
     logger::store_tokens(db, tesla.tokens())?;
     let mut tesla = tesla;
@@ -237,8 +247,8 @@ async fn main() -> Result<()> {
             let db2 = db.clone();
             tokio::spawn(async move { logger::run(db2).await });
             let addr: SocketAddr = format!("{bind}:{port}").parse()?;
-            let backend = auth::resolve_password_backend(None)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let backend =
+                auth::resolve_password_backend(None).map_err(|e| anyhow::anyhow!("{e}"))?;
             server::serve(db, addr, backend).await?;
         }
         Cmd::Doctor => {

@@ -7,6 +7,11 @@ let settings = {};
 let cars = [];
 let dashGen = 0;
 let dashAbort = null;
+let uiLayout = "classic";
+let currentMeta = "vehicle";
+let liveTimer = null;
+const dashCache = new Map();
+const META_IDS = new Set(["vehicle", "battery", "trips", "software"]);
 
 function isAbort(e) {
   return !!(e && (e.name === "AbortError" || e.code === 20));
@@ -19,7 +24,45 @@ function toLocalInput(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+let currentRange = "30d";
+const RANGE_LABEL = {
+  "1d": "24h",
+  "7d": "7 days",
+  "30d": "30 days",
+  "90d": "90 days",
+  "1y": "1 year",
+  all: "All time",
+};
+
+function rangeSpanLabel() {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const short = (v) => {
+    const m = String(v || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return "";
+    return `${Number(m[3])} ${months[Number(m[2]) - 1]}`;
+  };
+  const a = short($("from")?.value);
+  const b = short($("to")?.value);
+  return a && b ? `${a} – ${b}` : "Dates";
+}
+
+function paintRange() {
+  const btn = $("range-toggle");
+  if (!btn) return;
+  btn.textContent = RANGE_LABEL[currentRange] || rangeSpanLabel();
+  btn.setAttribute("aria-expanded", $("range")?.classList.contains("open") ? "true" : "false");
+  document.querySelectorAll(".presets button").forEach((b) => {
+    b.classList.toggle("is-on", b.dataset.range === currentRange);
+  });
+}
+
+function setRangeOpen(open) {
+  $("range")?.classList.toggle("open", open);
+  paintRange();
+}
+
 function applyRange(key) {
+  currentRange = key;
   const to = new Date();
   const from = new Date(to);
   if (key === "1d") from.setDate(to.getDate() - 1);
@@ -30,6 +73,7 @@ function applyRange(key) {
   else if (key === "all") from.setFullYear(2016, 0, 1);
   $("from").value = toLocalInput(from);
   $("to").value = toLocalInput(to);
+  paintRange();
 }
 
 function parseGrafanaTimeFrom(rel, toMs) {
@@ -123,6 +167,23 @@ function flattenPanels(panels, acc = []) {
 }
 
 function renderNav() {
+  if (uiLayout === "grouped") {
+    const pages = [
+      ["vehicle", "Vehicle"],
+      ["battery", "Battery"],
+      ["trips", "Trips"],
+      ["software", "Software"],
+    ];
+    $("nav-list").innerHTML =
+      `<h2>Car</h2>` +
+      pages
+        .map(
+          ([id, title]) =>
+            `<a href="#${id}" data-path="${id}" class="${id === currentMeta ? "active" : ""}">${title}</a>`
+        )
+        .join("");
+    return;
+  }
   const folders = {};
   for (const d of dashboards) {
     (folders[d.folder] ||= []).push(d);
@@ -148,6 +209,7 @@ async function loadDashboard(path) {
   const { signal } = dashAbort;
   currentPath = path;
   renderNav();
+  clearLive();
   try {
     const dash = await api("/api/dashboards/" + path, { signal });
     if (gen !== dashGen) return;
@@ -159,6 +221,7 @@ async function loadDashboard(path) {
       return Math.max(m, g.y + g.h);
     }, 8);
     const board = $("board");
+    board.classList.remove("grouped");
     board.style.height = maxY * ROW_H + 24 + "px";
     board.innerHTML = "";
     const v = vars();
@@ -260,7 +323,7 @@ async function fillGeomapTrack(body, panel, v, ctl, targets) {
   }
 }
 
-async function fillPanel(body, panel, v, ctl = {}) {
+async function fillPanel(body, panel, v, ctl = {}, dash = currentDash) {
   if (panel.type === "row" || panel.type === "text" || panel.type === "dashlist") {
     body.textContent = panel.options?.content || "";
     return;
@@ -268,8 +331,8 @@ async function fillPanel(body, panel, v, ctl = {}) {
   const targets = [];
   for (const t of panel.targets || []) {
     let sql = t.rawSql;
-    if (!sql && t.panelId != null && currentDash) {
-      const src = flattenPanels(currentDash.panels).find((p) => p.id === t.panelId);
+    if (!sql && t.panelId != null && dash) {
+      const src = flattenPanels(dash.panels).find((p) => p.id === t.panelId);
       sql = src?.targets?.find((x) => x.rawSql)?.rawSql;
     }
     if (sql) targets.push({ rawSql: sql });
@@ -830,19 +893,39 @@ function emptyCol(rows, col) {
   return !(rows || []).some((r) => r[col] != null && r[col] !== "");
 }
 
+function storyRowId(kind, row) {
+  const keys = kind === "drive" ? ["drive_id", "Drive ID"] : ["id", "charging_process_id", "Charging Process ID"];
+  for (const key of keys) {
+    if (row[key] != null && row[key] !== "") return row[key];
+  }
+  const names = Object.keys(row);
+  for (const key of keys) {
+    const found = names.find((k) => k.toLowerCase() === key.toLowerCase());
+    if (found && row[found] != null && row[found] !== "") return row[found];
+  }
+  return null;
+}
+
 function drawTable(body, panel, cols, rows) {
   const slice = sortRowsByDate(cols, rows).slice(0, 500);
   const show = cols.filter((c) => !hiddenCol(c, panel) && !emptyCol(slice, c));
   const headers = show.length ? show : cols.filter((c) => !hiddenCol(c, panel));
   const isVampire = headers.some((c) => /range_lost_per_hour|standby/.test(c));
   const stats = isVampire ? vampireStats(slice) : null;
+  const open = body.closest(".panel")?.dataset.open || "";
   body.innerHTML =
     `<table><thead><tr>${headers.map((c) => `<th>${escapeHtml(headerLabel(panel, c))}</th>`).join("")}</tr></thead><tbody>` +
     slice
       .map((r) => {
         const sev = isVampire ? vampireRowClass(r, stats) : { cls: "", title: "" };
-        const tr = ` class="${sev.cls}"` + (sev.title ? ` title="${escapeHtml(sev.title)}"` : "");
-        return `<tr${tr}>${headers
+        const id = open ? storyRowId(open, r) : null;
+        const cls = [id != null ? "row-open" : "", sev.cls].filter(Boolean).join(" ");
+        const title = sev.title || (id != null ? (open === "drive" ? "Open this drive" : "Open this charge") : "");
+        const attrs =
+          (cls ? ` class="${cls}"` : "") +
+          (title ? ` title="${escapeHtml(title)}"` : "") +
+          (id != null ? ` data-open-id="${escapeHtml(String(id))}" tabindex="0" role="button"` : "");
+        return `<tr${attrs}>${headers
           .map((c) => {
             const cell = formatCell(panel, c, r[c]);
             const st = cell.color && cell.color !== "transparent" ? ` style="color:${cell.color};font-weight:600"` : "";
@@ -1424,14 +1507,19 @@ function drawBarChart(el, panel, cols, rows) {
       .join("")}</div>`;
 }
 
+function osmTiles() {
+  return L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OSM",
+    maxZoom: 19,
+    errorTileUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+  });
+}
+
 function ensureRouteMap(el) {
   if (el._tmMap) return el._tmMap;
   el.innerHTML = "";
   const map = L.map(el).setView([54, -2], 6);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    attribution: "&copy; OSM",
-    maxZoom: 19,
-  }).addTo(map);
+  osmTiles().addTo(map);
   const g = { map, line: null, fitted: false };
   el._tmMap = g;
   return g;
@@ -1446,10 +1534,7 @@ function drawGeomap(el, panel, cols, rows, opts = {}) {
       el._tmMap = null;
     }
     const map = L.map(el).setView([54, -2], 6);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: "&copy; OSM",
-      maxZoom: 19,
-    }).addTo(map);
+    osmTiles().addTo(map);
     const latKey = cols.find((c) => /lat/i.test(c));
     const lonKey = cols.find((c) => /lon|lng/i.test(c));
     const pts = [];
@@ -1635,27 +1720,783 @@ function fmt(v) {
   return String(v);
 }
 
+const META = [
+  {
+    id: "vehicle",
+    title: "Vehicle",
+    lead: "Where the car is, and what it is doing — locks, sentry, tires, and climate — from the last Tesla API poll.",
+    live: true,
+    sections: [
+      {
+        title: "Awake and asleep",
+        panels: [
+          ["states.json", 2],
+          ["states.json", 6],
+          ["states.json", 8],
+          ["states.json", 14],
+        ],
+      },
+    ],
+  },
+  {
+    id: "battery",
+    title: "Battery",
+    lead: "Level, health, and every charge. Open a row to see the place and how the power came in.",
+    sections: [
+      { title: "Level", panels: [["charge-level.json", 2]] },
+      {
+        title: "Health",
+        panels: [
+          ["battery-health.json", 13],
+          ["battery-health.json", 14],
+          ["battery-health.json", 17],
+          ["battery-health.json", 12],
+          ["battery-health.json", 27],
+          ["battery-health.json", 28],
+        ],
+      },
+      {
+        title: "Charging",
+        panels: [
+          ["charging-stats.json", 8],
+          ["charging-stats.json", 10],
+          ["charging-stats.json", 14],
+          ["charging-stats.json", 27],
+          ["charging-stats.json", 26],
+          ["charging-stats.json", 31],
+          ["charging-stats.json", 32],
+          ["charging-stats.json", 33],
+          ["charging-stats.json", 15],
+          ["charging-stats.json", 16],
+          ["charging-stats.json", 18],
+          ["charging-stats.json", 24],
+          ["charging-stats.json", 20],
+          ["charging-stats.json", 29],
+          ["charging-stats.json", 2],
+          ["charging-stats.json", 13],
+          ["charging-stats.json", 4],
+          ["charging-stats.json", 6],
+          ["charges.json", 10],
+          ["charges.json", 20],
+          ["charges.json", 14],
+          ["charges.json", 15],
+          ["charges.json", 6],
+          ["charges.json", 17],
+        ],
+      },
+      { title: "While parked", panels: [["vampire-drain.json", 2]] },
+      {
+        title: "Projected range",
+        panels: [
+          ["projected-range.json", 2],
+          ["projected-range.json", 6],
+          ["projected-range.json", 5],
+        ],
+      },
+    ],
+  },
+  {
+    id: "trips",
+    title: "Trips",
+    lead: "Distance, efficiency, and places. Open a drive to follow the route.",
+    sections: [
+      {
+        title: "This period",
+        panels: [
+          ["drive-stats.json", 20],
+          ["drive-stats.json", 16],
+          ["drive-stats.json", 22],
+          ["drive-stats.json", 26],
+          ["drive-stats.json", 8],
+          ["drive-stats.json", 14],
+          ["drive-stats.json", 33],
+          ["drive-stats.json", 35],
+          ["drive-stats.json", 34],
+          ["drive-stats.json", 36],
+          ["drive-stats.json", 32],
+          ["drive-stats.json", 30],
+          ["drive-stats.json", 24],
+        ],
+      },
+      {
+        title: "Efficiency",
+        panels: [
+          ["efficiency.json", 4],
+          ["efficiency.json", 8],
+          ["efficiency.json", 6],
+          ["efficiency.json", 2],
+          ["efficiency.json", 14],
+          ["efficiency.json", 12],
+          ["efficiency.json", 15],
+        ],
+      },
+      {
+        title: "Drives",
+        panels: [
+          ["drives.json", 4],
+          ["drives.json", 5],
+          ["drives.json", 6],
+          ["drives.json", 7],
+          ["drives.json", 2],
+          ["drives.json", 9],
+        ],
+      },
+      { title: "Mileage", panels: [["mileage.json", 2]] },
+      { title: "Timeline", panels: [["timeline.json", 2]] },
+      { title: "By period", panels: [["statistics.json", 2]] },
+      {
+        title: "Selected trip",
+        when: "trip",
+        panels: [
+          ["trip.json", 6],
+          ["trip.json", 10],
+          ["trip.json", 38],
+          ["trip.json", 26],
+          ["trip.json", 28],
+          ["trip.json", 30],
+          ["trip.json", 32],
+          ["trip.json", 22],
+          ["trip.json", 43],
+          ["trip.json", 40],
+          ["trip.json", 20],
+          ["trip.json", 42],
+          ["trip.json", 8],
+        ],
+      },
+      {
+        title: "Places",
+        panels: [
+          ["visited.json", 2],
+          ["visited.json", 5],
+          ["visited.json", 6],
+          ["visited.json", 7],
+          ["locations.json", 12],
+          ["locations.json", 20],
+          ["locations.json", 18],
+          ["locations.json", 16],
+          ["locations.json", 10],
+          ["locations.json", 14],
+          ["locations.json", 22],
+          ["locations.json", 2],
+          ["locations.json", 6],
+        ],
+      },
+      { title: "Dutch tax", panels: [["reports/dutch-tax.json", 2]] },
+    ],
+  },
+  {
+    id: "software",
+    title: "Software",
+    lead: "Firmware on the car, then this installation. The version you are running is the update history, not a second copy of the overview tile.",
+    sections: [
+      {
+        title: "Car",
+        panels: [
+          ["updates.json", 8],
+          ["updates.json", 6],
+          ["updates.json", 2],
+        ],
+      },
+      {
+        title: "This installation",
+        panels: [
+          ["database-info.json", 32],
+          ["database-info.json", 36],
+          ["database-info.json", 39],
+          ["database-info.json", 42],
+          ["database-info.json", 51],
+          ["database-info.json", 33],
+          ["database-info.json", 38],
+          ["database-info.json", 41],
+          ["database-info.json", 35],
+          ["database-info.json", 52],
+          ["database-info.json", 50],
+          ["database-info.json", 48],
+          ["database-info.json", 49],
+          ["database-info.json", 47],
+          ["database-info.json", 45],
+          ["database-info.json", 46],
+        ],
+      },
+    ],
+  },
+];
+
+function clearLive() {
+  if (liveTimer) clearTimeout(liveTimer);
+  liveTimer = null;
+}
+
+function reloadView() {
+  if (uiLayout === "grouped") return loadGrouped(currentMeta);
+  return loadDashboard(currentPath);
+}
+
+function flowSpan(panel) {
+  const w = panel.gridPos?.w || 24;
+  if (w >= 20) return 12;
+  if (w >= 12) return 6;
+  if (w >= 8) return 4;
+  if (w >= 4) return 3;
+  return 2;
+}
+
+function flowBodyHeight(panel) {
+  const h = panel.gridPos?.h || 8;
+  if (panel.type === "stat" || panel.type === "gauge") return h <= 3 ? 88 : 120;
+  if (panel.type === "table") return Math.min(480, Math.max(220, h * 16));
+  if (panel.type === "geomap") return 360;
+  if (panel.type === "piechart" || panel.type === "bargauge") return 260;
+  if (panel.type === "text") return 96;
+  return Math.min(420, Math.max(200, h * 14));
+}
+
+async function dashboardByPath(path, signal) {
+  const cached = dashCache.get(path);
+  if (cached) return cached;
+  const pending = api("/api/dashboards/" + path, { signal }).catch((e) => {
+    dashCache.delete(path);
+    throw e;
+  });
+  dashCache.set(path, pending);
+  return pending;
+}
+
+function n1(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "–";
+  return Math.abs(n) >= 100 ? n.toFixed(0) : n.toFixed(1);
+}
+
+function hoursLabel(hours, minutes) {
+  const m = Number.isFinite(Number(minutes))
+    ? Number(minutes)
+    : Number.isFinite(Number(hours))
+      ? Math.round(Number(hours) * 60)
+      : null;
+  if (m == null || m <= 0) return null;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  if (h <= 0) return `${rem} min`;
+  return rem ? `${h} h ${rem} min` : `${h} h`;
+}
+
+function chip(text, kind) {
+  return `<span class="chip${kind ? " " + kind : ""}">${escapeHtml(text)}</span>`;
+}
+
+function rangeApart(a, b) {
+  const x = Number(a);
+  const y = Number(b);
+  if (!Number.isFinite(x)) return false;
+  if (!Number.isFinite(y)) return true;
+  return Math.abs(x - y) > 1;
+}
+
+function climateLine(c, temp) {
+  const bits = [];
+  if (c.inside != null) bits.push(`Inside ${n1(c.inside)}°${temp}`);
+  if (c.outside != null) bits.push(`Outside ${n1(c.outside)}°${temp}`);
+  if (c.setpoint != null) bits.push(`Set ${n1(c.setpoint)}°${temp}`);
+  const set = Number(c.setpoint);
+  const pass = Number(c.passenger);
+  if (c.passenger != null && Number.isFinite(pass) && (!Number.isFinite(set) || Math.abs(pass - set) >= 0.5)) {
+    bits.push(`Passenger ${n1(pass)}°${temp}`);
+  }
+  if (c.defrostFront || c.defrostRear) bits.push("defrost");
+  return bits.join(" · ") || "–";
+}
+
+function paintLive(host, data) {
+  dropMaps(host);
+  const car = data.car || {};
+  const b = data.battery || {};
+  const d = data.drive || {};
+  const c = data.climate || {};
+  const body = data.body || {};
+  const tires = data.tires || {};
+  const sw = data.software || {};
+  const unit = data.lengthUnit || "km";
+  const temp = data.tempUnit || "C";
+  const pres = data.pressureUnit || "bar";
+  const name = car.name || car.marketingName || "Car";
+  const sub = [car.marketingName || (car.model ? "Model " + car.model : ""), car.trim, car.color]
+    .filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .join(" · ");
+  const level = Number(b.level);
+  const limit = Number(b.limit);
+  const charging = b.chargingState && !/disconnected|complete|stopped/i.test(b.chargingState);
+  const driving = d.shift && /^(D|R|N)$/.test(d.shift);
+  const chips = [];
+  if (body.locked === true) chips.push(chip("Locked", "on"));
+  else if (body.locked === false) chips.push(chip("Unlocked", "warn"));
+  if (body.sentry === true) chips.push(chip("Sentry", "hot"));
+  else if (body.sentry === false) chips.push(chip("Sentry off"));
+  if ((body.doorsOpen || []).length) chips.push(chip("Doors " + body.doorsOpen.join(", "), "warn"));
+  else if (data.hasDetail) chips.push(chip("Doors closed"));
+  if ((body.windowsOpen || []).length) chips.push(chip("Windows " + body.windowsOpen.join(", "), "warn"));
+  else if (data.hasDetail) chips.push(chip("Windows closed"));
+  if (body.frunkOpen) chips.push(chip("Frunk open", "warn"));
+  if (body.trunkOpen) chips.push(chip("Trunk open", "warn"));
+  if (c.on === true) chips.push(chip("Climate on", "on"));
+  else if (c.on === false) chips.push(chip("Climate off"));
+  if (sw.updateStatus) chips.push(chip("Update " + sw.updateStatus, "hot"));
+  const eta = hoursLabel(b.hoursToFull, b.minutesToFull);
+  let motion = "";
+  if (charging) {
+    const bits = [
+      b.powerKw != null ? `<b>${escapeHtml(String(b.powerKw))} kW</b>` : "",
+      b.voltage ? `${escapeHtml(String(b.voltage))} V` : "",
+      b.current ? `${escapeHtml(String(b.current))} A` : "",
+      b.energyAddedKwh != null ? `${n1(b.energyAddedKwh)} kWh added` : "",
+      eta ? eta + " to limit" : "",
+    ].filter(Boolean);
+    motion = `<div class="live-charge">${bits.join(" · ")}</div>`;
+  } else if (driving) {
+    const bits = [
+      `<b>${escapeHtml(d.shift)}</b>`,
+      d.speed != null ? `${n1(d.speed)} ${escapeHtml(d.speedUnit || "")}` : "",
+      d.powerKw != null ? `${escapeHtml(String(d.powerKw))} kW` : "",
+      d.heading != null ? `${escapeHtml(String(d.heading))}°` : "",
+      d.destination ? `to ${escapeHtml(d.destination)}` : "",
+      d.distanceToArrival != null ? `${n1(d.distanceToArrival)} ${escapeHtml(unit)}` : "",
+      d.minutesToArrival != null ? `${n1(d.minutesToArrival)} min` : "",
+    ].filter(Boolean);
+    motion = `<div class="live-drive">${bits.join(" · ")}</div>`;
+  }
+  const since = data.since ? `Since ${data.since}` : "";
+  const detail = data.detailAt ? `Last full read ${data.detailAt}` : data.hasDetail ? "" : "No full vehicle poll yet — lock, sentry, and software update show up after the logger reads the car.";
+  const tire = (key, label) => {
+    const t = tires[key] || {};
+    const cls = t.warning ? "warn" : "";
+    return `<div><span>${label}</span><span class="${cls}">${t.pressure == null ? "–" : n1(t.pressure) + " " + escapeHtml(pres)}</span></div>`;
+  };
+  const prefer = data.preferredRange === "ideal" ? "ideal" : "rated";
+  const alts = [];
+  if (prefer !== "rated" && rangeApart(b.rated, b.range)) alts.push(`${n1(b.rated)} ${unit} rated`);
+  if (prefer !== "ideal" && rangeApart(b.ideal, b.range)) alts.push(`${n1(b.ideal)} ${unit} ideal`);
+  if (rangeApart(b.est, b.range)) alts.push(`${n1(b.est)} ${unit} estimated`);
+  const where = [
+    data.place || "",
+    data.elevation != null ? `${n1(data.elevation)} ${data.elevationUnit || "m"}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const facts = [
+    ["Climate", climateLine(c, temp)],
+    ["Tires", ""],
+    ["Odometer", data.odometer == null ? "–" : `${n1(data.odometer)} ${unit}`],
+    ["Software", sw.version || "–"],
+  ];
+  const extras = (data.extras || [])
+    .map((e) => `<div><dt>${escapeHtml(e.label || "")}</dt><dd>${escapeHtml(e.value || "")}</dd></div>`)
+    .join("");
+  host.innerHTML = `<div class="live">
+    <div class="live-head">
+      <div><div class="live-name">${escapeHtml(name)}</div><div class="live-sub">${escapeHtml(sub)}</div></div>
+      <div class="live-state ${escapeHtml(String(data.state || "").toLowerCase())}">${escapeHtml(data.state || "unknown")}</div>
+    </div>
+    <p class="live-since">${escapeHtml([since, detail].filter(Boolean).join(" · "))}</p>
+    <div class="chips">${chips.join("")}</div>
+    <div class="live-split">
+      <div class="live-battery">
+        <div class="soc">${Number.isFinite(level) ? escapeHtml(String(level)) : "–"}<span>%</span></div>
+        <div class="soc-bar"><span style="width:${Number.isFinite(level) ? Math.max(0, Math.min(100, level)) : 0}%"></span>${Number.isFinite(limit) ? `<i style="left:${Math.max(0, Math.min(100, limit))}%"></i>` : ""}</div>
+        <div class="soc-meta">${b.range != null ? n1(b.range) + " " + escapeHtml(unit) + " " + escapeHtml(data.preferredRange || "rated") : "Range –"}${Number.isFinite(limit) ? " · limit " + limit + "%" : ""}${b.usable != null && b.usable !== b.level ? " · usable " + b.usable + "%" : ""}</div>
+        ${alts.length ? `<p class="soc-alt">${escapeHtml(alts.join(" · "))}</p>` : ""}
+        ${motion}
+      </div>
+      <div class="live-place">
+        <div class="live-map" id="live-map"></div>
+        ${where ? `<p class="live-where">${escapeHtml(where)}</p>` : ""}
+      </div>
+    </div>
+    <div class="live-facts">
+      <div class="fact"><h3>Climate</h3><p>${escapeHtml(facts[0][1])}</p></div>
+      <div class="fact"><h3>Tires</h3><div class="tires">${tire("fl", "FL")}${tire("fr", "FR")}${tire("rl", "RL")}${tire("rr", "RR")}</div></div>
+      <div class="fact"><h3>Odometer</h3><p>${escapeHtml(facts[2][1])}</p></div>
+      <div class="fact"><h3>Software</h3><p>${escapeHtml(facts[3][1])}</p></div>
+    </div>
+    ${extras ? `<dl class="live-extra">${extras}</dl>` : ""}
+  </div>`;
+  const mapEl = host.querySelector(".live-map");
+  const lat = Number(d.lat);
+  const lon = Number(d.lon);
+  if (mapEl && Number.isFinite(lat) && Number.isFinite(lon) && !(lat === 0 && lon === 0)) {
+    const map = L.map(mapEl, { zoomControl: false }).setView([lat, lon], 13);
+    osmTiles().addTo(map);
+    L.circleMarker([lat, lon], { radius: 8, color: "#e85d04", fillOpacity: 0.85, weight: 1 }).addTo(map);
+    mapEl._map = map;
+    requestAnimationFrame(() => map.invalidateSize());
+  } else if (mapEl) {
+    mapEl.textContent = "No position yet";
+  }
+}
+
+async function fillLive(host, ctl) {
+  try {
+    const data = await api("/api/cars/" + vars().car_id + "/live", { signal: ctl.signal });
+    if (stale(ctl) || !host.isConnected) return;
+    paintLive(host, data);
+  } catch (e) {
+    if (isAbort(e) || stale(ctl)) return;
+    if (host.isConnected) host.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+  }
+  if (!stale(ctl)) liveTimer = setTimeout(() => fillLive(host, ctl), 30000);
+}
+
+let storyGen = 0;
+
+function dropMaps(root) {
+  if (!root) return;
+  const seen = new Set();
+  const nodes = [root, ...root.querySelectorAll("*")];
+  for (const el of nodes) {
+    const map = el._map;
+    el._map = null;
+    if (!map || seen.has(map)) continue;
+    seen.add(map);
+    try {
+      map.remove();
+    } catch {
+      /* already torn down */
+    }
+  }
+}
+
+function storyWhen(s) {
+  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!m) return s ? String(s) : "";
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${Number(m[3])} ${months[Number(m[2]) - 1]} · ${m[4]}:${m[5]}`;
+}
+
+function storyLine(data, kind) {
+  if (kind === "charge") {
+    const power = (data.curve || []).map((p) => Number(p.power)).filter(Number.isFinite);
+    const soc = (data.curve || []).map((p) => p.soc);
+    if (power.length >= 2 && Math.max(...power) - Math.min(...power) > 1) return { values: power, label: "Charger power" };
+    const finite = soc.map(Number).filter(Number.isFinite);
+    if (finite.length >= 2 && Math.max(...finite) - Math.min(...finite) >= 1) return { values: soc, label: "State of charge" };
+    return null;
+  }
+  const soc = data.soc || [];
+  const finite = soc.map(Number).filter(Number.isFinite);
+  if (finite.length >= 2 && Math.max(...finite) - Math.min(...finite) >= 1) return { values: soc, label: "State of charge" };
+  const elev = data.elevation || [];
+  if (elev.map(Number).filter(Number.isFinite).length >= 2) {
+    return { values: elev, label: data.lengthUnit === "mi" ? "Elevation, ft" : "Elevation, m" };
+  }
+  if (finite.length >= 2) return { values: soc, label: "State of charge" };
+  return null;
+}
+
+function sparkSvg(spec) {
+  if (!spec) return "";
+  const nums = spec.values.map(Number).filter(Number.isFinite);
+  if (nums.length < 2) return "";
+  const w = 640;
+  const h = 64;
+  const pad = 6;
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  const span = max - min || 1;
+  const pts = nums
+    .map((v, i) => {
+      const x = pad + (i / (nums.length - 1)) * (w - pad * 2);
+      const y = pad + (1 - (v - min) / span) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return `<div class="story-spark-wrap"><svg viewBox="0 0 ${w} ${h}" class="story-spark" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" /></svg><span>${escapeHtml(spec.label)}</span></div>`;
+}
+
+function mountPath(el, path) {
+  const pts = (path || []).filter((p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1])));
+  if (!pts.length || typeof L === "undefined") {
+    el.remove();
+    return;
+  }
+  const map = L.map(el, { zoomControl: false, attributionControl: false });
+  osmTiles().addTo(map);
+  let line = null;
+  if (pts.length === 1) {
+    L.circleMarker(pts[0], { radius: 7, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 0.9, weight: 1 }).addTo(map);
+  } else {
+    L.polyline(pts, { color: "#111217", weight: 7, opacity: 0.9 }).addTo(map);
+    line = L.polyline(pts, { color: "#e85d04", weight: 3, opacity: 1 }).addTo(map);
+    L.circleMarker(pts[0], { radius: 4, color: "#d8dde8", fillColor: "#d8dde8", fillOpacity: 1, weight: 0 }).addTo(map);
+    L.circleMarker(pts[pts.length - 1], { radius: 6, color: "#e85d04", fillColor: "#e85d04", fillOpacity: 1, weight: 0 }).addTo(map);
+  }
+  const fit = () => {
+    if (line) map.fitBounds(line.getBounds(), { padding: [18, 18] });
+    else map.setView(pts[0], 14);
+  };
+  el._map = map;
+  fit();
+  requestAnimationFrame(() => {
+    map.invalidateSize();
+    fit();
+  });
+}
+
+function paintStory(card, kind, data) {
+  const unit = data.lengthUnit || "km";
+  const when = storyWhen(data.start);
+  let title;
+  const bits = [when];
+  if (kind === "drive") {
+    const from = data.from || "Start";
+    const to = data.to || "End";
+    title = from === to ? from : `${from} → ${to}`;
+    if (data.distance != null) bits.push(`${n1(data.distance)} ${unit}`);
+    if (data.durationMin != null) {
+      const dur = hoursLabel(null, data.durationMin);
+      if (dur) bits.push(dur);
+    }
+    if (data.socStart != null && data.socEnd != null) bits.push(`${data.socStart}% → ${data.socEnd}%`);
+    if (data.consumption != null) bits.push(`${n1(data.consumption)} Wh/${unit}`);
+    if (data.open) bits.push("still driving");
+  } else {
+    title = data.place || "Charge";
+    if (data.energyAddedKwh != null) bits.push(`${n1(data.energyAddedKwh)} kWh`);
+    if (data.durationMin != null) {
+      const dur = hoursLabel(null, data.durationMin);
+      if (dur) bits.push(dur);
+    }
+    if (data.socStart != null && data.socEnd != null) bits.push(`${data.socStart}% → ${data.socEnd}%`);
+    const powers = (data.curve || []).map((p) => Number(p.power)).filter(Number.isFinite);
+    const vary = powers.length >= 2 && Math.max(...powers) - Math.min(...powers) > 1;
+    if (data.powerMax != null) bits.push(vary ? `up to ${n1(data.powerMax)} kW` : `${n1(data.powerMax)} kW`);
+    if (data.cost != null && Number(data.cost) > 0) bits.push(`cost ${Number(data.cost).toFixed(2)}`);
+    if (data.open) bits.push("still charging");
+  }
+  card.innerHTML = `<div class="story-head">
+      <div><h3 class="story-title">${escapeHtml(title)}</h3><p class="story-sub">${escapeHtml(bits.filter(Boolean).join(" · "))}</p></div>
+      <button type="button" class="story-close" aria-label="Close">Close</button>
+    </div>
+    <div class="story-map"></div>
+    ${sparkSvg(storyLine(data, kind))}`;
+  const mapEl = card.querySelector(".story-map");
+  if (mapEl) mountPath(mapEl, data.path);
+}
+
+function dismissStory(story) {
+  if (!story) return;
+  storyGen += 1;
+  const map = story.querySelector(".story-map");
+  if (map?._map) {
+    map._map.remove();
+    map._map = null;
+  }
+  story.remove();
+}
+
+async function openStory(panel, id) {
+  const kind = panel.dataset.open;
+  const gen = ++storyGen;
+  const card = document.createElement("article");
+  card.className = "story";
+  card.dataset.storyId = String(id);
+  card.dataset.storyKind = kind;
+  card.innerHTML = `<p class="story-wait">Opening…</p>`;
+  panel.before(card);
+  card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  try {
+    const car = vars().car_id;
+    const url = kind === "drive" ? `/api/cars/${car}/drives/${encodeURIComponent(id)}` : `/api/cars/${car}/charges/${encodeURIComponent(id)}`;
+    const data = await api(url);
+    if (gen !== storyGen || !card.isConnected) return;
+    paintStory(card, kind, data);
+  } catch (e) {
+    if (gen !== storyGen || !card.isConnected) return;
+    card.innerHTML = `<p class="err">${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function onBoardActivate(ev) {
+  const board = $("board");
+  if (!board) return;
+  const close = ev.type === "click" ? ev.target.closest?.(".story-close") : null;
+  if (close && board.contains(close)) {
+    const story = close.closest(".story");
+    story?.parentElement?.querySelectorAll("tr.is-open").forEach((tr) => tr.classList.remove("is-open"));
+    dismissStory(story);
+    return;
+  }
+  const tr = ev.target.closest?.("tr.row-open");
+  if (!tr || !board.contains(tr)) return;
+  if (ev.type === "keydown" && ev.key !== "Enter" && ev.key !== " ") return;
+  if (ev.type === "keydown") ev.preventDefault();
+  const panel = tr.closest(".panel");
+  const id = tr.dataset.openId;
+  if (!panel || !id) return;
+  const same = tr.classList.contains("is-open");
+  board.querySelectorAll("tr.is-open").forEach((row) => row.classList.remove("is-open"));
+  board.querySelectorAll(".story").forEach((s) => dismissStory(s));
+  if (same) return;
+  tr.classList.add("is-open");
+  openStory(panel, id);
+}
+
+async function loadGrouped(id) {
+  const page = META.find((p) => p.id === id) || META[0];
+  const gen = ++dashGen;
+  dashAbort?.abort();
+  dashAbort = new AbortController();
+  const { signal } = dashAbort;
+  clearLive();
+  currentMeta = page.id;
+  renderNav();
+  $("title").textContent = page.title;
+  const board = $("board");
+  dropMaps(board);
+  board.classList.add("grouped");
+  board.style.height = "auto";
+  board.innerHTML = `<p class="meta-lead">${escapeHtml(page.lead)}</p>`;
+  const ctl = { gen, signal };
+  try {
+    let liveHost = null;
+    if (page.live) {
+      liveHost = document.createElement("div");
+      board.appendChild(liveHost);
+      fillLive(liveHost, ctl);
+    }
+    const paths = [...new Set(page.sections.flatMap((s) => s.panels.map((p) => p[0])))];
+    const dashes = {};
+    await Promise.all(
+      paths.map(async (path) => {
+        dashes[path] = await dashboardByPath(path, signal);
+      })
+    );
+    if (gen !== dashGen) return;
+    const v = vars();
+    for (const section of page.sections) {
+      if (section.when === "trip") {
+        const q = new URLSearchParams(location.search);
+        if (!q.has("drive_id") && !q.has("charging_process_id")) continue;
+      }
+      const sec = document.createElement("section");
+      sec.className = "meta-section";
+      sec.innerHTML = `<h2>${escapeHtml(section.title)}</h2><div class="meta-grid"></div>`;
+      const grid = sec.querySelector(".meta-grid");
+      let any = false;
+      for (const [path, id] of section.panels) {
+        const dash = dashes[path];
+        const panel = flattenPanels(dash?.panels).find((p) => p.id === id);
+        if (!panel || panel.type === "row" || panel.type === "dashlist") continue;
+        any = true;
+        const el = document.createElement("div");
+        const g = panel.gridPos || { w: 12, h: 8 };
+        el.className =
+          "panel flow" +
+          (g.h <= 3 ? " compact" : "") +
+          (panel.type === "stat" || panel.type === "gauge" ? " panel-kpi" : "");
+        el.style.gridColumn = `span ${flowSpan(panel)}`;
+        if ((path === "drives.json" && (id === 2 || id === 9)) || (path === "charges.json" && (id === 6 || id === 17))) {
+          el.dataset.open = path.startsWith("drives") ? "drive" : "charge";
+        }
+        const bodyH = flowBodyHeight(panel);
+        el.innerHTML = `<h3>${escapeHtml(interpTitle(panel.title || "", v, panel))}</h3><div class="body"></div>`;
+        el.querySelector(".body").style.height = bodyH + "px";
+        grid.appendChild(el);
+        fillPanel(el.querySelector(".body"), panel, v, ctl, dash);
+      }
+      if (any) board.appendChild(sec);
+    }
+  } catch (e) {
+    if (isAbort(e) || gen !== dashGen) return;
+    board.insertAdjacentHTML("beforeend", `<div class="err">${escapeHtml(e.message)}</div>`);
+  }
+}
+
+function syncHashToLayout() {
+  const hash = location.hash.replace(/^#/, "");
+  if (uiLayout === "grouped") {
+    currentMeta = META_IDS.has(hash) ? hash : "vehicle";
+    if (hash !== currentMeta) history.replaceState(null, "", "#" + currentMeta);
+  } else if (hash.endsWith(".json")) {
+    currentPath = hash;
+  } else if (META_IDS.has(hash)) {
+    history.replaceState(null, "", "#" + (currentPath || "overview.json"));
+  }
+}
+
+async function chooseLayout(next) {
+  const layout = next === "grouped" ? "grouped" : "classic";
+  await api("/api/account/layout", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uiLayout: layout }),
+  });
+  uiLayout = layout;
+  const target = layout === "grouped" ? currentMeta || "vehicle" : currentPath || "overview.json";
+  if (location.hash.replace(/^#/, "") === target) await reloadView();
+  else location.hash = target;
+}
+
 async function boot() {
-  if (!(await tmAuth.route(await tmAuth.status()))) return;
+  const st = await tmAuth.status();
+  if (!(await tmAuth.route(st))) return;
+  uiLayout = st.uiLayout === "grouped" ? "grouped" : "classic";
+  const layoutSel = $("ui-layout");
+  if (layoutSel) layoutSel.value = uiLayout;
   applyRange("30d");
   settings = await api("/api/settings");
   cars = await api("/api/cars");
   dashboards = await api("/api/dashboards");
   $("car").innerHTML = cars.map((c) => `<option value="${c.id}">${c.name || "car " + c.id}</option>`).join("");
+  syncHashToLayout();
   renderNav();
-  const hash = location.hash.replace(/^#/, "");
-  if (hash) currentPath = hash;
   document.querySelectorAll(".presets button").forEach((b) =>
     b.addEventListener("click", () => {
       applyRange(b.dataset.range);
-      loadDashboard(currentPath);
+      if (window.matchMedia("(max-width: 800px)").matches) setRangeOpen(false);
+      reloadView();
     })
   );
-  $("car").addEventListener("change", () => loadDashboard(currentPath));
-  $("from").addEventListener("change", () => loadDashboard(currentPath));
-  $("to").addEventListener("change", () => loadDashboard(currentPath));
+  $("range-toggle")?.addEventListener("click", () => {
+    setRangeOpen(!$("range").classList.contains("open"));
+  });
+  $("car").addEventListener("change", () => reloadView());
+  const noteCustomRange = () => {
+    currentRange = "";
+    paintRange();
+    reloadView();
+  };
+  $("from").addEventListener("change", noteCustomRange);
+  $("to").addEventListener("change", noteCustomRange);
+  if (layoutSel) {
+    layoutSel.addEventListener("change", () => {
+      chooseLayout(layoutSel.value).catch((e) => {
+        layoutSel.value = uiLayout;
+        $("invite-url").textContent = e.message || String(e);
+      });
+    });
+  }
+  const board = $("board");
+  if (board && !board.dataset.storyBound) {
+    board.dataset.storyBound = "1";
+    board.addEventListener("click", onBoardActivate);
+    board.addEventListener("keydown", onBoardActivate);
+  }
   window.addEventListener("hashchange", () => {
-    currentPath = location.hash.replace(/^#/, "") || "overview.json";
+    const hash = location.hash.replace(/^#/, "");
+    if (uiLayout === "grouped") {
+      if (!META_IDS.has(hash)) {
+        location.hash = currentMeta || "vehicle";
+        return;
+      }
+      currentMeta = hash;
+      loadGrouped(currentMeta);
+      return;
+    }
+    if (META_IDS.has(hash)) {
+      location.hash = currentPath || "overview.json";
+      return;
+    }
+    currentPath = hash || "overview.json";
     loadDashboard(currentPath);
   });
   $("nav-list").addEventListener("click", (e) => {
@@ -1664,7 +2505,7 @@ async function boot() {
     e.preventDefault();
     location.hash = a.dataset.path;
   });
-  await loadDashboard(currentPath);
+  await reloadView();
 }
 
 boot().catch((e) => {

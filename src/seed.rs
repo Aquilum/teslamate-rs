@@ -6,7 +6,8 @@ const VIN: &str = "5YJSA7E2XNF000001";
 pub fn seed(conn: &mut Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     conn.execute_batch(
-        "         DELETE FROM charging_invoices;
+        "         DELETE FROM vehicle_snapshots;
+         DELETE FROM charging_invoices;
          DELETE FROM charges;
          DELETE FROM charging_processes;
          DELETE FROM positions;
@@ -189,6 +190,67 @@ pub fn seed(conn: &mut Connection) -> Result<()> {
         [],
     )?;
 
+    let detail = serde_json::json!({
+        "display_name": "Mock S",
+        "state": "asleep",
+        "charge_state": {
+            "battery_level": 72,
+            "usable_battery_level": 71,
+            "battery_range": 210.0,
+            "est_battery_range": 198.0,
+            "ideal_battery_range": 230.0,
+            "charge_limit_soc": 80,
+            "charging_state": "Disconnected",
+            "charger_power": 0,
+            "time_to_full_charge": 0.0,
+            "conn_charge_cable": "<invalid>",
+            "battery_heater_on": false
+        },
+        "drive_state": {
+            "latitude": 51.5074,
+            "longitude": -0.1278,
+            "speed": null,
+            "power": 0,
+            "shift_state": null,
+            "heading": 12
+        },
+        "climate_state": {
+            "inside_temp": 18.5,
+            "outside_temp": 12.0,
+            "driver_temp_setting": 21.0,
+            "is_climate_on": false,
+            "is_preconditioning": false,
+            "climate_keeper_mode": "off",
+            "cabin_overheat_protection": "On",
+            "is_front_defroster_on": false,
+            "is_rear_defroster_on": false
+        },
+        "vehicle_state": {
+            "odometer": odo / 1.609344,
+            "car_version": "2026.32.4 abcdef12",
+            "locked": true,
+            "sentry_mode": true,
+            "is_user_present": false,
+            "valet_mode": false,
+            "df": 0, "dr": 0, "pf": 0, "pr": 0, "ft": 0, "rt": 0,
+            "fd_window": 0, "fp_window": 0, "rd_window": 0, "rp_window": 0,
+            "software_update": {"status": "available", "version": "2026.44.3"},
+            "tpms_pressure_fl": 42.0,
+            "tpms_pressure_fr": 41.5,
+            "tpms_pressure_rl": 40.0,
+            "tpms_pressure_rr": 40.2,
+            "tpms_soft_warning_rl": true,
+            "dashcam_state": "Available",
+            "center_display_state": 0
+        },
+        "vehicle_config": {
+            "car_type": "models",
+            "exterior_color": "Red",
+            "wheel_type": "Base19"
+        }
+    });
+    crate::live::record_snapshot(conn, 1, "asleep", Some(&detail))?;
+
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
 }
@@ -301,7 +363,7 @@ fn seed_charge(
 ) -> Result<()> {
     let minutes = if dc { 28 } else { 180 };
     let start = format!("{date} {start_tod}");
-    let end = format!("{date} {}", add_minutes(start_tod, minutes));
+    let end = date_time_plus(date, start_tod, minutes);
     let lat = if dc { 51.4700 } else { 51.5074 };
     let lon = if dc { -0.4543 } else { -0.1278 };
     let energy = (end_soc - start_soc) as f64 * 0.95;
@@ -341,10 +403,7 @@ fn seed_charge(
         let t = i as f64 / ticks as f64;
         let soc = start_soc as f64 + (end_soc - start_soc) as f64 * t;
         let added = energy * t;
-        let ts = format!(
-            "{date} {}",
-            add_minutes(start_tod, (minutes * i as i64) / ticks as i64)
-        );
+        let ts = date_time_plus(date, start_tod, (minutes * i as i64) / ticks as i64);
         conn.execute(
             "INSERT INTO charges (id, date, battery_level, charge_energy_added, charger_actual_current,
                 charger_phases, charger_pilot_current, charger_power, charger_voltage, fast_charger_present,
@@ -373,6 +432,18 @@ fn seed_charge(
     }
     *charge_id += 1;
     Ok(())
+}
+
+/// Clock time plus minutes, carrying the calendar day when a charge passes midnight.
+fn date_time_plus(date: &str, hms: &str, minutes: i64) -> String {
+    let parts: Vec<i64> = hms.split(':').filter_map(|s| s.parse().ok()).collect();
+    let base = parts.first().copied().unwrap_or(0) * 60 + parts.get(1).copied().unwrap_or(0);
+    let total = base + minutes;
+    let day = total.div_euclid(24 * 60);
+    let mins = total.rem_euclid(24 * 60);
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap_or_default()
+        + chrono::Duration::days(day);
+    format!("{} {:02}:{:02}:00", d.format("%Y-%m-%d"), mins / 60, mins % 60)
 }
 
 fn add_minutes(hms: &str, minutes: i64) -> String {

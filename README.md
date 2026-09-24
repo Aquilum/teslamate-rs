@@ -46,6 +46,8 @@ cargo run --release -- serve --bind 127.0.0.1 --port 4011 --no-logger --auth loc
 
 Car telemetry stays in the shared SQLite file. Profiles only control who can open the dashboards.
 
+Each account picks an interface, stored on that profile: **Classic dashboards** (the Grafana pages) or **Grouped** (Vehicle, Battery, Trips, Software). Grouped keeps each history on one page and adds the live vehicle card TeslaMate showed outside Grafana — where the car is, locks, sentry, closures, tires, and climate — from the last Owner API poll. A drive or a charge opens in place from its row: the route or the charger, the battery, and one line of how it went.
+
 ## Build
 
 ```
