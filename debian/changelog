@@ -1,9 +1,17 @@
+teslamate-rs (0.2.0-1) UNRELEASED; urgency=medium
+
+  * Add grouped locations and asynchronous historical geofence matching.
+  * Improve grouped live vehicle fallbacks and location map reliability.
+
+ -- Tom Dewey <tom@fleetcom.org>  Fri, 25 Sep 2026 22:30:00 +0100
+
 teslamate-rs (0.1.0-3) UNRELEASED; urgency=medium
 
   * Apply PR #2 security hardening to the grouped UI release.
   * Require an exact CSRF referer origin match.
 
  -- Tom Dewey <tom@fleetcom.org>  Fri, 25 Sep 2026 18:27:00 +0100
+
 
 teslamate-rs (0.1.0-2) UNRELEASED; urgency=medium
 
