@@ -7,7 +7,7 @@ use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode};
@@ -111,6 +111,7 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         query_cache: QueryCache::default(),
         query_gate: QueryGate::default(),
         setup_allowed,
+        location_jobs: crate::app_state::LocationJobs::default(),
     };
     let app = Router::new()
         .route("/", get(index))
@@ -120,6 +121,10 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         .route("/api/cars/{car_id}/drives/{drive_id}", get(car_drive))
         .route("/api/cars/{car_id}/charges/{charge_id}", get(car_charge))
         .route("/api/settings", get(settings))
+        .route("/api/geofences", get(list_geofences).post(create_geofence))
+        .route("/api/geofences/rematch", post(rematch_geofences))
+        .route("/api/geofences/job", get(location_job_status))
+        .route("/api/geofences/{id}", put(update_geofence).delete(delete_geofence))
         .route("/api/dashboards", get(list_dashboards))
         .route("/api/dashboards/{*path}", get(get_dashboard))
         .route("/api/query", post(run_query))
@@ -403,6 +408,94 @@ async fn settings(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>
         })))
     })
     .await
+}
+
+async fn list_geofences(
+    _user: AuthUser,
+    State(app): State<App>,
+) -> Result<Json<Value>, AppError> {
+    spawn_db(app.db.clone(), |conn| crate::locations::list(conn)).await.map(Json)
+}
+
+async fn create_geofence(
+    _user: AuthUser,
+    State(app): State<App>,
+    Json(body): Json<crate::locations::GeofenceInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Err(e) = crate::locations::validate(&body) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": e.to_string()}))));
+    }
+    let db = app.db.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = db.lock();
+        crate::locations::save(&mut conn, None, body)
+    })
+    .await
+    .map_err(|e| crate::auth::internal_err(format!("location task: {e}")))?
+    .map_err(crate::auth::internal_err)?;
+    let job = app.location_jobs.start(app.db.clone());
+    Ok(Json(json!({"ok": true, "location": result, "job": job})))
+}
+
+async fn update_geofence(
+    _user: AuthUser,
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Json(body): Json<crate::locations::GeofenceInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Err(e) = crate::locations::validate(&body) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": e.to_string()}))));
+    }
+    let db = app.db.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = db.lock();
+        crate::locations::save(&mut conn, Some(id), body)
+    })
+    .await
+    .map_err(|e| crate::auth::internal_err(format!("location task: {e}")))?
+    .map_err(|e| {
+        if e.to_string() == "location not found" {
+            (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "location not found"})))
+        } else {
+            crate::auth::internal_err(e)
+        }
+    })?;
+    let job = app.location_jobs.start(app.db.clone());
+    Ok(Json(json!({"ok": true, "location": result, "job": job})))
+}
+
+async fn delete_geofence(
+    _user: AuthUser,
+    State(app): State<App>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = app.db.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        let mut conn = db.lock();
+        crate::locations::delete(&mut conn, id)
+    })
+    .await
+    .map_err(|e| crate::auth::internal_err(format!("location task: {e}")))?
+    .map_err(crate::auth::internal_err)?;
+    if !removed {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "location not found"}))));
+    }
+    let job = app.location_jobs.start(app.db.clone());
+    Ok(Json(json!({"ok": true, "job": job})))
+}
+
+async fn rematch_geofences(
+    _user: AuthUser,
+    State(app): State<App>,
+) -> Json<Value> {
+    Json(json!({"ok": true, "job": app.location_jobs.start(app.db.clone())}))
+}
+
+async fn location_job_status(
+    _user: AuthUser,
+    State(app): State<App>,
+) -> Json<Value> {
+    Json(app.location_jobs.status())
 }
 
 trait OptionalJson {

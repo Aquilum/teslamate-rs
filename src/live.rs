@@ -99,7 +99,23 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
         )
         .optional()?;
 
-    let pos = latest_position(conn, car_id)?;
+    // Stream rows are sparse and may contain placeholder (0, 0) coordinates.
+    // Each part of the live card needs the last position that measured it.
+    let pos = latest_position(conn, car_id, PositionKind::Latest)?;
+    let battery_pos = latest_position(conn, car_id, PositionKind::Battery)?;
+    let location_pos = latest_position(conn, car_id, PositionKind::Location)?;
+    let odometer_pos = latest_position(conn, car_id, PositionKind::Odometer)?;
+    let climate_pos = latest_position(conn, car_id, PositionKind::Climate)?;
+    let tires_pos = latest_position(conn, car_id, PositionKind::Tires)?;
+    let software_row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT version, start_date FROM updates
+             WHERE car_id=?1 AND end_date IS NOT NULL AND version IS NOT NULL AND TRIM(version) <> ''
+             ORDER BY start_date DESC LIMIT 1",
+            [car_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
     let detail = snap
         .as_ref()
         .and_then(|(_, _, _, json)| json.as_ref())
@@ -135,7 +151,7 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
 
     let battery = battery_block(
         detail.as_ref(),
-        pos.as_ref(),
+        battery_pos.as_ref(),
         length_unit,
         &preferred,
         &mut extras,
@@ -143,15 +159,16 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
     let drive = drive_block(
         detail.as_ref(),
         pos.as_ref(),
+        location_pos.as_ref(),
         length_unit,
         speed_unit,
         &mut extras,
     );
-    let climate = climate_block(detail.as_ref(), pos.as_ref(), show_temp, &mut extras);
+    let climate = climate_block(detail.as_ref(), climate_pos.as_ref(), show_temp, &mut extras);
     let body = body_block(detail.as_ref(), &mut extras);
-    let tires = tires_block(detail.as_ref(), pos.as_ref(), show_pressure);
-    let software = software_block(detail.as_ref(), &mut extras);
-    let odometer = odometer_block(detail.as_ref(), pos.as_ref(), length_unit);
+    let tires = tires_block(detail.as_ref(), tires_pos.as_ref(), show_pressure);
+    let software = software_block(detail.as_ref(), software_row.as_ref().map(|(v, _)| v.as_str()), &mut extras);
+    let odometer = odometer_block(detail.as_ref(), odometer_pos.as_ref(), length_unit);
 
     if let Some(d) = detail.as_ref() {
         if let Some(wheels) = tesla::str_field(d, &["vehicle_config", "wheel_type"]) {
@@ -165,7 +182,7 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
         (Some(la), Some(lo)) => place_name(conn, la, lo)?,
         _ => None,
     };
-    let elevation = match (lat, lon, pos.as_ref()) {
+    let elevation = match (lat, lon, location_pos.as_ref()) {
         (Some(la), Some(lo), Some(p)) => match (p.lat, p.lon, p.elevation_m) {
             (Some(plat), Some(plon), Some(m)) if haversine_m(la, lo, plat, plon) <= 400.0 => {
                 Some(elevation_in(m as f64, length_unit))
@@ -187,12 +204,17 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
         "pressureUnit": show_pressure,
         "preferredRange": preferred,
         "battery": battery,
+        "batteryAt": battery_pos.as_ref().map(|p| &p.date),
         "drive": drive,
+        "positionAt": location_pos.as_ref().map(|p| &p.date),
         "climate": climate,
+        "climateAt": climate_pos.as_ref().map(|p| &p.date),
         "body": body,
         "tires": tires,
         "software": software,
+        "softwareAt": software_row.as_ref().map(|(_, at)| at),
         "odometer": odometer,
+        "odometerAt": odometer_pos.as_ref().map(|p| &p.date),
         "place": place,
         "elevation": elevation,
         "elevationUnit": if length_unit == "mi" { "ft" } else { "m" },
@@ -201,6 +223,7 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
 }
 
 struct Pos {
+    date: String,
     battery_level: Option<i64>,
     usable: Option<i64>,
     rated_km: Option<f64>,
@@ -220,16 +243,37 @@ struct Pos {
     defrost_rear: Option<i64>,
 }
 
-fn latest_position(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Pos>> {
-    conn.query_row(
+enum PositionKind {
+    Latest,
+    Battery,
+    Location,
+    Odometer,
+    Climate,
+    Tires,
+}
+
+fn latest_position(conn: &Connection, car_id: i64, kind: PositionKind) -> rusqlite::Result<Option<Pos>> {
+    let predicate = match kind {
+        PositionKind::Latest => "1=1",
+        PositionKind::Battery => "battery_level IS NOT NULL",
+        PositionKind::Location => "latitude IS NOT NULL AND longitude IS NOT NULL AND NOT (latitude = 0 AND longitude = 0)",
+        PositionKind::Odometer => "odometer IS NOT NULL",
+        PositionKind::Climate => "inside_temp IS NOT NULL OR outside_temp IS NOT NULL OR passenger_temp_setting IS NOT NULL",
+        PositionKind::Tires => "tpms_pressure_fl IS NOT NULL OR tpms_pressure_fr IS NOT NULL OR tpms_pressure_rl IS NOT NULL OR tpms_pressure_rr IS NOT NULL",
+    };
+    let sql = format!(
         "SELECT battery_level, usable_battery_level, rated_battery_range_km, ideal_battery_range_km,
                 est_battery_range_km, outside_temp, inside_temp, latitude, longitude, speed, power,
                 odometer, tpms_pressure_fl, tpms_pressure_fr, tpms_pressure_rl, tpms_pressure_rr,
-                elevation, passenger_temp_setting, is_front_defroster_on, is_rear_defroster_on
-         FROM positions WHERE car_id=?1 ORDER BY date DESC LIMIT 1",
+                elevation, passenger_temp_setting, is_front_defroster_on, is_rear_defroster_on, date
+         FROM positions WHERE car_id=?1 AND ({predicate}) ORDER BY date DESC LIMIT 1"
+    );
+    conn.query_row(
+        &sql,
         [car_id],
         |r| {
             Ok(Pos {
+                date: r.get(20)?,
                 battery_level: r.get(0)?,
                 usable: r.get(1)?,
                 rated_km: r.get(2)?,
@@ -267,13 +311,15 @@ fn battery_block(
         .or_else(|| pos.and_then(|p| p.usable));
     let rated = range_miles(d, "battery_range")
         .map(|mi| miles(mi, length))
-        .or_else(|| pos.and_then(|p| p.rated_km).map(|km| km_to(km, length)));
+        .or_else(|| pos.and_then(|p| valid_range_km(p.rated_km)).map(|km| km_to(km, length)));
     let ideal = range_miles(d, "ideal_battery_range")
         .map(|mi| miles(mi, length))
-        .or_else(|| pos.and_then(|p| p.ideal_km).map(|km| km_to(km, length)));
+        .or_else(|| pos.and_then(|p| valid_range_km(p.ideal_km)).map(|km| km_to(km, length)))
+        .filter(|value| rated.is_some_and(|r| *value <= r * 1.5 && *value >= r * 0.5));
     let est = range_miles(d, "est_battery_range")
         .map(|mi| miles(mi, length))
-        .or_else(|| pos.and_then(|p| p.est_km).map(|km| km_to(km, length)));
+        .or_else(|| pos.and_then(|p| valid_range_km(p.est_km)).map(|km| km_to(km, length)))
+        .filter(|value| rated.is_some_and(|r| *value <= r * 1.5 && *value >= r * 0.2));
     let preferred_range = match preferred {
         "ideal" => ideal.or(rated),
         _ => rated.or(ideal),
@@ -328,6 +374,7 @@ fn battery_block(
 fn drive_block(
     detail: Option<&Value>,
     pos: Option<&Pos>,
+    location: Option<&Pos>,
     length: &str,
     speed_unit: &str,
     extras: &mut Vec<Value>,
@@ -340,9 +387,11 @@ fn drive_block(
             pos.and_then(|p| p.speed_kmh)
                 .map(|kmh| km_to(kmh as f64, if speed_unit == "mph" { "mi" } else { "km" }))
         });
-    let lat = tesla::f64_field(d, &["drive_state", "latitude"]).or_else(|| pos.and_then(|p| p.lat));
-    let lon =
-        tesla::f64_field(d, &["drive_state", "longitude"]).or_else(|| pos.and_then(|p| p.lon));
+    let detail_location = tesla::f64_field(d, &["drive_state", "latitude"])
+        .zip(tesla::f64_field(d, &["drive_state", "longitude"]))
+        .filter(|(lat, lon)| !(*lat == 0.0 && *lon == 0.0));
+    let lat = detail_location.map(|(lat, _)| lat).or_else(|| location.and_then(|p| p.lat));
+    let lon = detail_location.map(|(_, lon)| lon).or_else(|| location.and_then(|p| p.lon));
     let dest = meaningful(tesla::str_field(
         d,
         &["drive_state", "active_route", "destination"],
@@ -519,9 +568,10 @@ fn tires_block(detail: Option<&Value>, pos: Option<&Pos>, unit: &str) -> Value {
     Value::Object(out)
 }
 
-fn software_block(detail: Option<&Value>, extras: &mut Vec<Value>) -> Value {
+fn software_block(detail: Option<&Value>, last_version: Option<&str>, extras: &mut Vec<Value>) -> Value {
     let d = detail.unwrap_or(&Value::Null);
-    let version = meaningful(tesla::str_field(d, &["vehicle_state", "car_version"]));
+    let version = meaningful(tesla::str_field(d, &["vehicle_state", "car_version"]))
+        .or_else(|| meaningful(last_version));
     let status = meaningful(tesla::str_field(
         d,
         &["vehicle_state", "software_update", "status"],
@@ -559,6 +609,11 @@ fn odometer_block(detail: Option<&Value>, pos: Option<&Pos>, length: &str) -> Op
 
 fn range_miles(v: &Value, key: &str) -> Option<f64> {
     tesla::f64_field(v, &["charge_state", key])
+        .filter(|mi| mi.is_finite() && *mi > 0.0 && *mi < 800.0)
+}
+
+fn valid_range_km(km: Option<f64>) -> Option<f64> {
+    km.filter(|v| v.is_finite() && *v > 0.0 && *v < 1280.0)
 }
 
 fn meaningful(s: Option<&str>) -> Option<&str> {
@@ -782,6 +837,51 @@ mod tests {
         assert!((view["odometer"].as_f64().unwrap() - 100.0).abs() < 0.05);
         assert!((view["battery"]["range"].as_f64().unwrap() - 100.0).abs() < 0.05);
         assert!((view["tires"]["fl"]["pressure"].as_f64().unwrap() - 42.1).abs() < 0.15);
+    }
+
+    #[test]
+    fn offline_view_uses_last_measured_battery_after_sparse_stream_position() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO positions (date, latitude, longitude, battery_level,
+                rated_battery_range_km, ideal_battery_range_km, odometer,
+                inside_temp, outside_temp, car_id)
+             VALUES ('2026-09-20 20:50:28', 51.6, -0.2, 63, 345.74, 1607.73,
+                160.9344, 20, 14, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO positions (date, latitude, longitude, battery_level,
+                rated_battery_range_km, ideal_battery_range_km, car_id)
+             VALUES ('2026-09-25 17:51:50', 0, 0, 85, 483.3169888, 1607.73066, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO positions (date, latitude, longitude, battery_level, car_id)
+             VALUES ('2026-09-25 17:53:08', 0, 0, NULL, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO updates (start_date, end_date, version, car_id)
+             VALUES ('2026-09-16 19:41:15', '2026-09-16 19:41:30', '2026.32.3', 1)",
+            [],
+        )
+        .unwrap();
+        record_snapshot(&conn, 1, "offline", None).unwrap();
+        let view = live_view(&conn, 1).unwrap().unwrap();
+        assert_eq!(view["battery"]["level"], json!(85));
+        assert_eq!(view["battery"]["rated"], json!(300.3));
+        assert!(view["battery"]["ideal"].is_null());
+        assert!(view["battery"]["est"].is_null());
+        assert_eq!(view["drive"]["lat"], json!(51.6));
+        assert_eq!(view["drive"]["lon"], json!(-0.2));
+        assert_eq!(view["odometer"], json!(100.0));
+        assert_eq!(view["climate"]["inside"], json!(20.0));
+        assert_eq!(view["software"]["version"], json!("2026.32.3"));
+        assert_eq!(view["positionAt"], json!("2026-09-20 20:50:28"));
     }
 
     #[test]

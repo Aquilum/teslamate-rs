@@ -9,6 +9,7 @@ mod import;
 mod invoices;
 mod live;
 mod logger;
+mod locations;
 mod mock;
 mod pam_auth;
 mod query_allowlist;

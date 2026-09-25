@@ -1765,6 +1765,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parked_percentage_uses_fractional_seconds_in_selected_window() {
+        let dashboard: serde_json::Value =
+            serde_json::from_str(include_str!("../dashboards/states.json")).unwrap();
+        let raw = dashboard["panels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == 8)
+            .unwrap()["targets"][0]["rawSql"]
+            .as_str()
+            .unwrap();
+        let mut v = vars();
+        v.from_ms = 1_785_000_000_000;
+        v.to_ms = v.from_ms + 100_000;
+        let sql = translate(raw, &v);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE drives (car_id INTEGER, start_date TEXT, end_date TEXT);")
+            .unwrap();
+        let start = v.from_ts();
+        let end = fmt_ms(v.from_ms + 10_000);
+        conn.execute(
+            "INSERT INTO drives VALUES (?1, ?2, ?3)",
+            rusqlite::params![v.car_id, start, end],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drives VALUES (?1, '2024-01-01', NULL)",
+            [v.car_id],
+        )
+        .unwrap();
+        let parked: f64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+        assert!((parked - 0.9).abs() < 1e-9, "{parked}: {sql}");
+    }
+
     fn visit_json(
         path: &std::path::Path,
         conn: &rusqlite::Connection,

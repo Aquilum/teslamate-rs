@@ -11,7 +11,66 @@ let uiLayout = "classic";
 let currentMeta = "vehicle";
 let liveTimer = null;
 const dashCache = new Map();
-const META_IDS = new Set(["vehicle", "battery", "trips", "software"]);
+const META_IDS = new Set(["vehicle", "battery", "trips", "software", "locations"]);
+const QUERY_CLIENT_CONCURRENCY = 3;
+let queryActive = 0;
+const queryQueue = [];
+const locationJobsWatched = new Set();
+const locationJobsRefreshed = new Set();
+
+function queryAbortError() {
+  const err = new Error("aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function acquireQuerySlot(signal) {
+  if (signal?.aborted) return Promise.reject(queryAbortError());
+  if (queryActive < QUERY_CLIENT_CONCURRENCY) {
+    queryActive++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const entry = { resolve, reject, signal };
+    entry.onAbort = () => {
+      const i = queryQueue.indexOf(entry);
+      if (i >= 0) {
+        queryQueue.splice(i, 1);
+        reject(queryAbortError());
+      }
+    };
+    signal?.addEventListener("abort", entry.onAbort, { once: true });
+    queryQueue.push(entry);
+  });
+}
+
+function releaseQuerySlot() {
+  while (queryQueue.length) {
+    const entry = queryQueue.shift();
+    entry.signal?.removeEventListener("abort", entry.onAbort);
+    if (entry.signal?.aborted) {
+      entry.reject(queryAbortError());
+      continue;
+    }
+    entry.resolve();
+    return;
+  }
+  queryActive--;
+}
+
+async function dashboardQuery(q, signal) {
+  await acquireQuerySlot(signal);
+  try {
+    return await api("/api/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(q),
+      signal,
+    });
+  } finally {
+    releaseQuerySlot();
+  }
+}
 
 function isAbort(e) {
   return !!(e && (e.name === "AbortError" || e.code === 20));
@@ -181,7 +240,8 @@ function renderNav() {
           ([id, title]) =>
             `<a href="#${id}" data-path="${id}" class="${id === currentMeta ? "active" : ""}">${title}</a>`
         )
-        .join("");
+        .join("") +
+      `<h2>Places</h2><a href="#locations" data-path="locations" class="${currentMeta === "locations" ? "active" : ""}">Locations</a>`;
     return;
   }
   const folders = {};
@@ -263,12 +323,7 @@ function attachIds(q, sql) {
 
 async function queryPanelSql(sql, v, panel, ctl, extra = {}) {
   const q = attachIds({ sql, ...withPanelTime(v, panel), ...extra }, sql);
-  const data = await api("/api/query", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(q),
-    signal: ctl.signal,
-  });
+  const data = await dashboardQuery(q, ctl.signal);
   if (stale(ctl) || (data && data.cancelled)) {
     const err = new Error("aborted");
     err.name = "AbortError";
@@ -356,12 +411,7 @@ async function fillPanel(body, panel, v, ctl = {}, dash = currentDash) {
         if (params.get("charging_process_id")) q.charging_process_id = Number(params.get("charging_process_id"));
       }
       try {
-        const data = await api("/api/query", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(q),
-          signal: ctl.signal,
-        });
+        const data = await dashboardQuery(q, ctl.signal);
         if (ctl.gen != null && ctl.gen !== dashGen) return;
         if (data && data.cancelled) return;
         results.push(data);
@@ -1951,6 +2001,7 @@ const META = [
       },
     ],
   },
+  { id: "locations", title: "Locations", locations: true, sections: [] },
 ];
 
 function clearLive() {
@@ -2017,9 +2068,11 @@ function chip(text, kind) {
 }
 
 function rangeApart(a, b) {
+  if (a == null || a === "") return false;
   const x = Number(a);
-  const y = Number(b);
   if (!Number.isFinite(x)) return false;
+  if (b == null || b === "") return true;
+  const y = Number(b);
   if (!Number.isFinite(y)) return true;
   return Math.abs(x - y) > 1;
 }
@@ -2055,8 +2108,8 @@ function paintLive(host, data) {
     .filter(Boolean)
     .filter((v, i, a) => a.indexOf(v) === i)
     .join(" · ");
-  const level = Number(b.level);
-  const limit = Number(b.limit);
+  const level = b.level == null ? NaN : Number(b.level);
+  const limit = b.limit == null ? NaN : Number(b.limit);
   const charging = b.chargingState && !/disconnected|complete|stopped/i.test(b.chargingState);
   const driving = d.shift && /^(D|R|N)$/.test(d.shift);
   const chips = [];
@@ -2096,8 +2149,8 @@ function paintLive(host, data) {
     ].filter(Boolean);
     motion = `<div class="live-drive">${bits.join(" · ")}</div>`;
   }
-  const since = data.since ? `Since ${data.since}` : "";
-  const detail = data.detailAt ? `Last full read ${data.detailAt}` : data.hasDetail ? "" : "No full vehicle poll yet — lock, sentry, and software update show up after the logger reads the car.";
+  const since = data.since ? `Since ${formatTime(data.since)}` : "";
+  const observed = (at) => at ? `Last read ${formatTime(at)}` : "";
   const tire = (key, label) => {
     const t = tires[key] || {};
     const cls = t.warning ? "warn" : "";
@@ -2128,26 +2181,28 @@ function paintLive(host, data) {
       <div><div class="live-name">${escapeHtml(name)}</div><div class="live-sub">${escapeHtml(sub)}</div></div>
       <div class="live-state ${escapeHtml(String(data.state || "").toLowerCase())}">${escapeHtml(data.state || "unknown")}</div>
     </div>
-    <p class="live-since">${escapeHtml([since, detail].filter(Boolean).join(" · "))}</p>
+    ${since ? `<p class="live-since">${escapeHtml(since)}</p>` : ""}
     <div class="chips">${chips.join("")}</div>
     <div class="live-split">
       <div class="live-battery">
         <div class="soc">${Number.isFinite(level) ? escapeHtml(String(level)) : "–"}<span>%</span></div>
         <div class="soc-bar"><span style="width:${Number.isFinite(level) ? Math.max(0, Math.min(100, level)) : 0}%"></span>${Number.isFinite(limit) ? `<i style="left:${Math.max(0, Math.min(100, limit))}%"></i>` : ""}</div>
         <div class="soc-meta">${b.range != null ? n1(b.range) + " " + escapeHtml(unit) + " " + escapeHtml(data.preferredRange || "rated") : "Range –"}${Number.isFinite(limit) ? " · limit " + limit + "%" : ""}${b.usable != null && b.usable !== b.level ? " · usable " + b.usable + "%" : ""}</div>
+        ${data.batteryAt ? `<p class="live-note">${escapeHtml(observed(data.batteryAt))}</p>` : ""}
         ${alts.length ? `<p class="soc-alt">${escapeHtml(alts.join(" · "))}</p>` : ""}
         ${motion}
       </div>
       <div class="live-place">
         <div class="live-map" id="live-map"></div>
         ${where ? `<p class="live-where">${escapeHtml(where)}</p>` : ""}
+        ${data.positionAt ? `<p class="live-note">${escapeHtml(observed(data.positionAt))}</p>` : ""}
       </div>
     </div>
     <div class="live-facts">
-      <div class="fact"><h3>Climate</h3><p>${escapeHtml(facts[0][1])}</p></div>
+      <div class="fact"><h3>Climate</h3><p>${escapeHtml(facts[0][1])}</p>${data.climateAt ? `<small>${escapeHtml(observed(data.climateAt))}</small>` : ""}</div>
       <div class="fact"><h3>Tires</h3><div class="tires">${tire("fl", "FL")}${tire("fr", "FR")}${tire("rl", "RL")}${tire("rr", "RR")}</div></div>
-      <div class="fact"><h3>Odometer</h3><p>${escapeHtml(facts[2][1])}</p></div>
-      <div class="fact"><h3>Software</h3><p>${escapeHtml(facts[3][1])}</p></div>
+      <div class="fact"><h3>Odometer</h3><p>${escapeHtml(facts[2][1])}</p>${data.odometerAt ? `<small>${escapeHtml(observed(data.odometerAt))}</small>` : ""}</div>
+      <div class="fact"><h3>Software</h3><p>${escapeHtml(facts[3][1])}</p>${data.softwareAt ? `<small>${escapeHtml(`Recorded ${formatTime(data.softwareAt)}`)}</small>` : ""}</div>
     </div>
     ${extras ? `<dl class="live-extra">${extras}</dl>` : ""}
   </div>`;
@@ -2385,8 +2440,12 @@ async function loadGrouped(id) {
   dropMaps(board);
   board.classList.add("grouped");
   board.style.height = "auto";
-  board.innerHTML = `<p class="meta-lead">${escapeHtml(page.lead)}</p>`;
+  board.innerHTML = "";
   const ctl = { gen, signal };
+  if (page.locations) {
+    loadLocationsPage(board, signal);
+    return;
+  }
   try {
     let liveHost = null;
     if (page.live) {
@@ -2439,6 +2498,167 @@ async function loadGrouped(id) {
   } catch (e) {
     if (isAbort(e) || gen !== dashGen) return;
     board.insertAdjacentHTML("beforeend", `<div class="err">${escapeHtml(e.message)}</div>`);
+  }
+}
+
+async function loadLocationsPage(board, signal) {
+  board.innerHTML = `<section class="locations-page">
+    <p class="locations-intro">Add places such as Home and Work. Saved areas are shared across accounts and match past and future charging sessions and trip endpoints.</p>
+    <div class="locations-status"><span id="locations-summary"></span><button type="button" class="ghost" id="locations-rematch">Rematch history</button></div>
+    <div class="locations-editor">
+      <div><div class="location-map" id="location-map"></div><p class="locations-hint">Click the map to set the centre. Adjust the radius to cover the parking area.</p></div>
+      <form id="location-form" class="location-form">
+        <h2 id="location-form-title">New location</h2>
+        <label>Name<input name="name" maxlength="80" required placeholder="Home, Work, Supercharger"></label>
+        <div class="location-shortcuts"><button type="button" class="ghost" data-name="Home">Home</button><button type="button" class="ghost" data-name="Work">Work</button></div>
+        <div class="location-coords"><label>Latitude<input name="latitude" type="number" step="any" min="-90" max="90" required></label><label>Longitude<input name="longitude" type="number" step="any" min="-180" max="180" required></label></div>
+        <label>Radius <span class="range-value"><input name="radius" type="number" min="1" max="100000" step="1" value="100" required> metres</span></label>
+        <label>Charging rate<input name="cost_per_unit" type="number" min="0" step="0.0001" placeholder="Optional"></label>
+        <label>Rate is charged per<select name="billing_type"><option value="per_kwh">kWh added</option><option value="per_minute">minute connected</option></select></label>
+        <label>Session fee<input name="session_fee" type="number" min="0" step="0.01" placeholder="Optional"></label>
+        <p class="locations-hint">Currency is not stored per location; use one currency consistently. Saving queues a background rematch and recalculates charge costs.</p>
+        <div class="location-actions"><button type="submit">Save location</button><button type="button" class="ghost" id="location-cancel" hidden>Cancel edit</button></div>
+        <p class="location-error" id="location-error" role="alert" hidden></p>
+      </form>
+    </div>
+    <section class="locations-list"><h2>Saved locations</h2><div id="location-rows"></div></section>
+  </section>`;
+  try {
+    const data = await api("/api/geofences", { signal });
+    if (signal.aborted || !board.isConnected) return;
+    const locations = data.locations || [];
+    const summary = board.querySelector("#locations-summary");
+    const updateSummary = (suffix = "") => {
+      summary.textContent = `${locations.length} saved ${locations.length === 1 ? "location" : "locations"} · ${data.unassignedCharges || 0} charging sessions without a location${suffix}`;
+    };
+    updateSummary();
+    const mapEl = board.querySelector("#location-map");
+    const map = L.map(mapEl).setView(data.center || [54, -2], locations.length ? 12 : 6);
+    osmTiles().addTo(map);
+    mapEl._map = map;
+    const savedLayers = L.featureGroup().addTo(map);
+    let preview = null;
+    let editing = null;
+    const form = board.querySelector("#location-form");
+    const error = board.querySelector("#location-error");
+    const rows = board.querySelector("#location-rows");
+    const fmtCost = (v) => v == null ? "" : Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+    const fields = () => ({
+      latitude: Number(form.elements.latitude.value),
+      longitude: Number(form.elements.longitude.value),
+      radius: Number(form.elements.radius.value),
+    });
+    const showError = (message = "") => { error.textContent = message; error.hidden = !message; };
+    const drawPreview = (center = false) => {
+      const p = fields();
+      if (!Number.isFinite(p.latitude) || !Number.isFinite(p.longitude)) return;
+      if (preview) preview.remove();
+      preview = L.circle([p.latitude, p.longitude], { radius: p.radius || 100, color: "#e85d04", fillOpacity: 0.12 }).addTo(map);
+      if (center) map.setView([p.latitude, p.longitude], Math.max(map.getZoom(), 14));
+    };
+    const edit = (loc) => {
+      editing = loc || null;
+      form.elements.name.value = loc?.name || "";
+      form.elements.latitude.value = loc?.latitude ?? data.center?.[0] ?? 54;
+      form.elements.longitude.value = loc?.longitude ?? data.center?.[1] ?? -2;
+      form.elements.radius.value = loc?.radius ?? 100;
+      form.elements.cost_per_unit.value = fmtCost(loc?.costPerUnit);
+      form.elements.session_fee.value = fmtCost(loc?.sessionFee);
+      form.elements.billing_type.value = loc?.billingType || "per_kwh";
+      board.querySelector("#location-form-title").textContent = loc ? `Edit ${loc.name}` : "New location";
+      board.querySelector("#location-cancel").hidden = !loc;
+      form.querySelector('[type="submit"]').textContent = loc ? "Save changes" : "Save location";
+      showError();
+      drawPreview(true);
+    };
+    for (const loc of locations) {
+      L.circle([loc.latitude, loc.longitude], { radius: loc.radius, color: "#6ED0E0", fillOpacity: 0.1 })
+        .bindTooltip(escapeHtml(loc.name)).on("click", () => edit(loc)).addTo(savedLayers);
+    }
+    if (locations.length) map.fitBounds(savedLayers.getBounds().pad(0.2), { maxZoom: 14 });
+    rows.innerHTML = locations.length ? `<div class="location-table">${locations.map((loc) => `<article class="location-row"><div><strong>${escapeHtml(loc.name)}</strong><small>${Number(loc.latitude).toFixed(5)}, ${Number(loc.longitude).toFixed(5)} · ${loc.radius} m · ${loc.charges} charges · ${loc.driveEnds} trip ends</small><small>${loc.costPerUnit == null && loc.sessionFee == null ? "No charging rate" : `${loc.costPerUnit == null ? "" : `${fmtCost(loc.costPerUnit)} / ${loc.billingType === "per_minute" ? "min" : "kWh"}`}${loc.sessionFee == null ? "" : ` · ${fmtCost(loc.sessionFee)} session fee`}`}</small></div><div class="location-row-actions"><button type="button" class="ghost" data-edit="${loc.id}">Edit</button><button type="button" class="ghost danger" data-delete="${loc.id}">Delete</button></div></article>`).join("")}</div>` : `<p class="locations-empty">No locations yet. Click the map to place your first geofence.</p>`;
+    const pollJob = async () => {
+      if (signal.aborted || !board.isConnected) return;
+      try {
+        const job = await api("/api/geofences/job", { signal });
+        if (signal.aborted || !board.isConnected) return;
+        const id = job.id == null ? null : String(job.id);
+        if (id && (job.state === "queued" || job.state === "running")) {
+          locationJobsWatched.add(id);
+          updateSummary(job.state === "queued" ? " · Backfill queued" : " · Labelling previous charges and trip ends…");
+          setTimeout(pollJob, 1500);
+        } else if (job.state === "completed") {
+          if (id && locationJobsWatched.has(id) && !locationJobsRefreshed.has(id)) {
+            locationJobsRefreshed.add(id);
+            locationJobsWatched.delete(id);
+            loadGrouped("locations");
+          } else {
+            updateSummary(" · History rematch complete");
+          }
+        } else if (job.state === "failed") {
+          updateSummary(" · Rematch failed");
+          showError(job.error || "The history rematch failed.");
+        }
+      } catch (e) {
+        if (!isAbort(e) && !signal.aborted) showError(e.message);
+      }
+    };
+    pollJob();
+    board.querySelector("#locations-rematch").addEventListener("click", async () => {
+      if (!locations.length || !confirm("Match past charging sessions and trip ends to the nearest saved location? Non-invoice charge costs will be recalculated.")) return;
+      try {
+        const response = await api("/api/geofences/rematch", { method: "POST" });
+        if (response.job?.id != null) locationJobsWatched.add(String(response.job.id));
+        loadGrouped("locations");
+      } catch (e) { showError(e.message); }
+    });
+    form.elements.latitude.addEventListener("input", () => drawPreview());
+    form.elements.longitude.addEventListener("input", () => drawPreview());
+    form.elements.radius.addEventListener("input", () => drawPreview());
+    map.on("click", (event) => {
+      form.elements.latitude.value = event.latlng.lat.toFixed(6);
+      form.elements.longitude.value = event.latlng.lng.toFixed(6);
+      drawPreview();
+    });
+    form.querySelectorAll("[data-name]").forEach((button) => button.addEventListener("click", () => {
+      form.elements.name.value = button.dataset.name;
+      form.elements.name.focus();
+    }));
+    board.querySelector("#location-cancel").addEventListener("click", () => edit(null));
+    rows.querySelectorAll("[data-edit]").forEach((button) => button.addEventListener("click", () => edit(locations.find((loc) => loc.id === Number(button.dataset.edit)))));
+    rows.querySelectorAll("[data-delete]").forEach((button) => button.addEventListener("click", async () => {
+      const loc = locations.find((item) => item.id === Number(button.dataset.delete));
+      if (!loc || !confirm(`Delete ${loc.name}? Its charge and trip records will be matched to any remaining locations.`)) return;
+      try {
+        const response = await api(`/api/geofences/${loc.id}`, { method: "DELETE" });
+        if (response.job?.id != null) locationJobsWatched.add(String(response.job.id));
+        loadGrouped("locations");
+      } catch (e) { showError(e.message); }
+    }));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = {
+        name: form.elements.name.value,
+        ...fields(),
+        cost_per_unit: form.elements.cost_per_unit.value === "" ? null : Number(form.elements.cost_per_unit.value),
+        session_fee: form.elements.session_fee.value === "" ? null : Number(form.elements.session_fee.value),
+        billing_type: form.elements.billing_type.value,
+      };
+      try {
+        const response = await api(editing ? `/api/geofences/${editing.id}` : "/api/geofences", {
+          method: editing ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (response.job?.id != null) locationJobsWatched.add(String(response.job.id));
+        loadGrouped("locations");
+      } catch (e) { showError(e.message); }
+    });
+    drawPreview();
+    requestAnimationFrame(() => map.invalidateSize());
+  } catch (e) {
+    if (isAbort(e) || signal.aborted) return;
+    board.querySelector(".locations-page")?.insertAdjacentHTML("beforeend", `<p class="err">${escapeHtml(e.message)}</p>`);
   }
 }
 

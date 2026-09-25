@@ -14,6 +14,86 @@ const QUERY_CACHE_MAX_ROWS: usize = 20_000;
 const QUERY_STAT_MAX: usize = 256;
 const QUERY_STAT_SQL_LEN: usize = 240;
 
+#[derive(Default)]
+struct LocationJobState {
+    next_id: u64,
+    status: Option<Value>,
+    rerun: bool,
+}
+
+/// Coalesces geofence writes into a background pass over historical records.
+#[derive(Clone, Default)]
+pub struct LocationJobs {
+    inner: Arc<ParkingMutex<LocationJobState>>,
+}
+
+impl LocationJobs {
+    pub fn status(&self) -> Value {
+        self.inner.lock().status.clone().unwrap_or_else(|| json!({"state": "idle"}))
+    }
+
+    pub fn start(&self, db: Db) -> Value {
+        let id = {
+            let mut state = self.inner.lock();
+            let active = state.status.as_ref().is_some_and(|job| {
+                matches!(job["state"].as_str(), Some("queued" | "running"))
+            });
+            if active {
+                if state.status.as_ref().is_some_and(|job| job["state"] == "running") {
+                    state.rerun = true;
+                }
+                return state.status.clone().unwrap_or_else(|| json!({"state": "idle"}));
+            }
+            state.next_id += 1;
+            let id = state.next_id;
+            state.rerun = false;
+            state.status = Some(json!({
+                "id": id,
+                "state": "queued",
+                "updatedAt": chrono::Utc::now().to_rfc3339(),
+            }));
+            id
+        };
+
+        let inner = self.inner.clone();
+        let _task = tokio::task::spawn_blocking(move || loop {
+            {
+                let mut state = inner.lock();
+                state.status = Some(json!({
+                    "id": id,
+                    "state": "running",
+                    "updatedAt": chrono::Utc::now().to_rfc3339(),
+                }));
+            }
+            let result = {
+                let mut conn = db.lock();
+                crate::locations::rematch(&mut conn)
+            };
+            let mut state = inner.lock();
+            if state.rerun {
+                state.rerun = false;
+                continue;
+            }
+            state.status = Some(match result {
+                Ok(result) => json!({
+                    "id": id,
+                    "state": "completed",
+                    "updatedAt": chrono::Utc::now().to_rfc3339(),
+                    "result": result,
+                }),
+                Err(error) => json!({
+                    "id": id,
+                    "state": "failed",
+                    "updatedAt": chrono::Utc::now().to_rfc3339(),
+                    "error": error.to_string(),
+                }),
+            });
+            break;
+        });
+        self.status()
+    }
+}
+
 struct CachedQuery {
     at: Instant,
     payload: Value,
@@ -295,6 +375,7 @@ pub struct App {
     pub query_gate: QueryGate,
     /// First-admin setup is allowed (loopback bind or TESLAMATE_RS_ALLOW_SETUP=1).
     pub setup_allowed: bool,
+    pub location_jobs: LocationJobs,
 }
 
 impl HasAuthDb for App {
