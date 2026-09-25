@@ -298,7 +298,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "select 1 - sum(duration_min) / (EXTRACT(EPOCH  FROM (max(end_date) - min(start_date))) / 60), 1 as time from drives where car_id = $car_id;",
+          "rawSql": "SELECT 1.0 - COALESCE(SUM(MAX(0, MIN(unixepoch(end_date), ${__to:date:seconds}) - MAX(unixepoch(start_date), ${__from:date:seconds}))), 0) * 1.0 / MAX(1, ${__to:date:seconds} - ${__from:date:seconds}) AS parked, 1 AS time FROM drives WHERE car_id = $car_id AND end_date IS NOT NULL AND unixepoch(start_date) < ${__to:date:seconds} AND unixepoch(end_date) > ${__from:date:seconds};",
           "refId": "A",
           "sql": {
             "columns": [

@@ -2064,9 +2064,11 @@ function chip(text, kind) {
 }
 
 function rangeApart(a, b) {
+  if (a == null || a === "") return false;
   const x = Number(a);
-  const y = Number(b);
   if (!Number.isFinite(x)) return false;
+  if (b == null || b === "") return true;
+  const y = Number(b);
   if (!Number.isFinite(y)) return true;
   return Math.abs(x - y) > 1;
 }
@@ -2143,8 +2145,8 @@ function paintLive(host, data) {
     ].filter(Boolean);
     motion = `<div class="live-drive">${bits.join(" · ")}</div>`;
   }
-  const since = data.since ? `Since ${data.since}` : "";
-  const detail = data.detailAt ? `Last full read ${data.detailAt}` : data.hasDetail ? "" : "No full vehicle poll yet — lock, sentry, and software update show up after the logger reads the car.";
+  const since = data.since ? `Since ${formatTime(data.since)}` : "";
+  const observed = (at) => at ? `Last read ${formatTime(at)}` : "";
   const tire = (key, label) => {
     const t = tires[key] || {};
     const cls = t.warning ? "warn" : "";
@@ -2175,26 +2177,28 @@ function paintLive(host, data) {
       <div><div class="live-name">${escapeHtml(name)}</div><div class="live-sub">${escapeHtml(sub)}</div></div>
       <div class="live-state ${escapeHtml(String(data.state || "").toLowerCase())}">${escapeHtml(data.state || "unknown")}</div>
     </div>
-    <p class="live-since">${escapeHtml([since, detail].filter(Boolean).join(" · "))}</p>
+    ${since ? `<p class="live-since">${escapeHtml(since)}</p>` : ""}
     <div class="chips">${chips.join("")}</div>
     <div class="live-split">
       <div class="live-battery">
         <div class="soc">${Number.isFinite(level) ? escapeHtml(String(level)) : "–"}<span>%</span></div>
         <div class="soc-bar"><span style="width:${Number.isFinite(level) ? Math.max(0, Math.min(100, level)) : 0}%"></span>${Number.isFinite(limit) ? `<i style="left:${Math.max(0, Math.min(100, limit))}%"></i>` : ""}</div>
         <div class="soc-meta">${b.range != null ? n1(b.range) + " " + escapeHtml(unit) + " " + escapeHtml(data.preferredRange || "rated") : "Range –"}${Number.isFinite(limit) ? " · limit " + limit + "%" : ""}${b.usable != null && b.usable !== b.level ? " · usable " + b.usable + "%" : ""}</div>
+        ${data.batteryAt ? `<p class="live-note">${escapeHtml(observed(data.batteryAt))}</p>` : ""}
         ${alts.length ? `<p class="soc-alt">${escapeHtml(alts.join(" · "))}</p>` : ""}
         ${motion}
       </div>
       <div class="live-place">
         <div class="live-map" id="live-map"></div>
         ${where ? `<p class="live-where">${escapeHtml(where)}</p>` : ""}
+        ${data.positionAt ? `<p class="live-note">${escapeHtml(observed(data.positionAt))}</p>` : ""}
       </div>
     </div>
     <div class="live-facts">
-      <div class="fact"><h3>Climate</h3><p>${escapeHtml(facts[0][1])}</p></div>
+      <div class="fact"><h3>Climate</h3><p>${escapeHtml(facts[0][1])}</p>${data.climateAt ? `<small>${escapeHtml(observed(data.climateAt))}</small>` : ""}</div>
       <div class="fact"><h3>Tires</h3><div class="tires">${tire("fl", "FL")}${tire("fr", "FR")}${tire("rl", "RL")}${tire("rr", "RR")}</div></div>
-      <div class="fact"><h3>Odometer</h3><p>${escapeHtml(facts[2][1])}</p></div>
-      <div class="fact"><h3>Software</h3><p>${escapeHtml(facts[3][1])}</p></div>
+      <div class="fact"><h3>Odometer</h3><p>${escapeHtml(facts[2][1])}</p>${data.odometerAt ? `<small>${escapeHtml(observed(data.odometerAt))}</small>` : ""}</div>
+      <div class="fact"><h3>Software</h3><p>${escapeHtml(facts[3][1])}</p>${data.softwareAt ? `<small>${escapeHtml(`Recorded ${formatTime(data.softwareAt)}`)}</small>` : ""}</div>
     </div>
     ${extras ? `<dl class="live-extra">${extras}</dl>` : ""}
   </div>`;
@@ -2432,7 +2436,7 @@ async function loadGrouped(id) {
   dropMaps(board);
   board.classList.add("grouped");
   board.style.height = "auto";
-  board.innerHTML = `<p class="meta-lead">${escapeHtml(page.lead)}</p>`;
+  board.innerHTML = "";
   const ctl = { gen, signal };
   try {
     let liveHost = null;

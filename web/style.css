@@ -113,7 +113,6 @@ tr.row-warn:hover td, tr.row-bad:hover td { filter: brightness(1.12); }
 
 #board.grouped { height: auto !important; padding: 12px 16px 48px; }
 #board.grouped .panel.flow { position: relative; left: auto; top: auto; width: auto; height: auto; container-type: inline-size; }
-.meta-lead { color: var(--muted); margin: 0 0 16px; max-width: 68ch; }
 .meta-section { margin: 0 0 22px; }
 .meta-section > h2 { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 4px 0 10px; font-weight: 600; }
 .meta-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 8px; }
@@ -147,6 +146,8 @@ tr.row-warn:hover td, tr.row-bad:hover td { filter: brightness(1.12); }
 .soc-bar > span { display: block; height: 100%; background: var(--accent); }
 .soc-bar > i { position: absolute; top: -2px; width: 2px; height: 14px; background: #d8dde8; }
 .soc-meta, .soc-alt, .live-note { color: var(--muted); font-size: 12px; }
+.live-note { margin: 5px 0 0; }
+.fact small { color: var(--muted); font-size: 11px; }
 .soc-alt { margin: 4px 0 0; }
 .live-charge, .live-drive { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px 14px; }
 .live-charge b, .live-drive b { font-weight: 600; }
