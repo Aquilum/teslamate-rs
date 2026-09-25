@@ -15,6 +15,8 @@ const META_IDS = new Set(["vehicle", "battery", "trips", "software", "locations"
 const QUERY_CLIENT_CONCURRENCY = 3;
 let queryActive = 0;
 const queryQueue = [];
+const locationJobsWatched = new Set();
+const locationJobsRefreshed = new Set();
 
 function queryAbortError() {
   const err = new Error("aborted");
@@ -2514,7 +2516,7 @@ async function loadLocationsPage(board, signal) {
         <label>Charging rate<input name="cost_per_unit" type="number" min="0" step="0.0001" placeholder="Optional"></label>
         <label>Rate is charged per<select name="billing_type"><option value="per_kwh">kWh added</option><option value="per_minute">minute connected</option></select></label>
         <label>Session fee<input name="session_fee" type="number" min="0" step="0.01" placeholder="Optional"></label>
-        <p class="locations-hint">Currency is not stored per location; use one currency consistently. Saving reassigns nearby history and recalculates charge costs.</p>
+        <p class="locations-hint">Currency is not stored per location; use one currency consistently. Saving queues a background rematch and recalculates charge costs.</p>
         <div class="location-actions"><button type="submit">Save location</button><button type="button" class="ghost" id="location-cancel" hidden>Cancel edit</button></div>
         <p class="location-error" id="location-error" role="alert" hidden></p>
       </form>
@@ -2525,7 +2527,11 @@ async function loadLocationsPage(board, signal) {
     const data = await api("/api/geofences", { signal });
     if (signal.aborted || !board.isConnected) return;
     const locations = data.locations || [];
-    board.querySelector("#locations-summary").textContent = `${locations.length} saved ${locations.length === 1 ? "location" : "locations"} · ${data.unassignedCharges || 0} charging sessions without a location`;
+    const summary = board.querySelector("#locations-summary");
+    const updateSummary = (suffix = "") => {
+      summary.textContent = `${locations.length} saved ${locations.length === 1 ? "location" : "locations"} · ${data.unassignedCharges || 0} charging sessions without a location${suffix}`;
+    };
+    updateSummary();
     const mapEl = board.querySelector("#location-map");
     const map = L.map(mapEl).setView(data.center || [54, -2], locations.length ? 12 : 6);
     osmTiles().addTo(map);
@@ -2571,10 +2577,38 @@ async function loadLocationsPage(board, signal) {
     }
     if (locations.length) map.fitBounds(savedLayers.getBounds().pad(0.2), { maxZoom: 14 });
     rows.innerHTML = locations.length ? `<div class="location-table">${locations.map((loc) => `<article class="location-row"><div><strong>${escapeHtml(loc.name)}</strong><small>${Number(loc.latitude).toFixed(5)}, ${Number(loc.longitude).toFixed(5)} · ${loc.radius} m · ${loc.charges} charges · ${loc.driveEnds} trip ends</small><small>${loc.costPerUnit == null && loc.sessionFee == null ? "No charging rate" : `${loc.costPerUnit == null ? "" : `${fmtCost(loc.costPerUnit)} / ${loc.billingType === "per_minute" ? "min" : "kWh"}`}${loc.sessionFee == null ? "" : ` · ${fmtCost(loc.sessionFee)} session fee`}`}</small></div><div class="location-row-actions"><button type="button" class="ghost" data-edit="${loc.id}">Edit</button><button type="button" class="ghost danger" data-delete="${loc.id}">Delete</button></div></article>`).join("")}</div>` : `<p class="locations-empty">No locations yet. Click the map to place your first geofence.</p>`;
+    const pollJob = async () => {
+      if (signal.aborted || !board.isConnected) return;
+      try {
+        const job = await api("/api/geofences/job", { signal });
+        if (signal.aborted || !board.isConnected) return;
+        const id = job.id == null ? null : String(job.id);
+        if (id && (job.state === "queued" || job.state === "running")) {
+          locationJobsWatched.add(id);
+          updateSummary(job.state === "queued" ? " · Backfill queued" : " · Labelling previous charges and trip ends…");
+          setTimeout(pollJob, 1500);
+        } else if (job.state === "completed") {
+          if (id && locationJobsWatched.has(id) && !locationJobsRefreshed.has(id)) {
+            locationJobsRefreshed.add(id);
+            locationJobsWatched.delete(id);
+            loadGrouped("locations");
+          } else {
+            updateSummary(" · History rematch complete");
+          }
+        } else if (job.state === "failed") {
+          updateSummary(" · Rematch failed");
+          showError(job.error || "The history rematch failed.");
+        }
+      } catch (e) {
+        if (!isAbort(e) && !signal.aborted) showError(e.message);
+      }
+    };
+    pollJob();
     board.querySelector("#locations-rematch").addEventListener("click", async () => {
       if (!locations.length || !confirm("Match past charging sessions and trip ends to the nearest saved location? Non-invoice charge costs will be recalculated.")) return;
       try {
-        await api("/api/geofences/rematch", { method: "POST" });
+        const response = await api("/api/geofences/rematch", { method: "POST" });
+        if (response.job?.id != null) locationJobsWatched.add(String(response.job.id));
         loadGrouped("locations");
       } catch (e) { showError(e.message); }
     });
@@ -2596,7 +2630,8 @@ async function loadLocationsPage(board, signal) {
       const loc = locations.find((item) => item.id === Number(button.dataset.delete));
       if (!loc || !confirm(`Delete ${loc.name}? Its charge and trip records will be matched to any remaining locations.`)) return;
       try {
-        await api(`/api/geofences/${loc.id}`, { method: "DELETE" });
+        const response = await api(`/api/geofences/${loc.id}`, { method: "DELETE" });
+        if (response.job?.id != null) locationJobsWatched.add(String(response.job.id));
         loadGrouped("locations");
       } catch (e) { showError(e.message); }
     }));
@@ -2610,11 +2645,12 @@ async function loadLocationsPage(board, signal) {
         billing_type: form.elements.billing_type.value,
       };
       try {
-        await api(editing ? `/api/geofences/${editing.id}` : "/api/geofences", {
+        const response = await api(editing ? `/api/geofences/${editing.id}` : "/api/geofences", {
           method: editing ? "PUT" : "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+        if (response.job?.id != null) locationJobsWatched.add(String(response.job.id));
         loadGrouped("locations");
       } catch (e) { showError(e.message); }
     });

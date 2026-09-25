@@ -92,8 +92,6 @@ pub fn save(conn: &mut Connection, id: Option<i64>, input: GeofenceInput) -> Res
         )?;
         tx.last_insert_rowid()
     };
-    reassign(&tx)?;
-    recalculate_costs(&tx)?;
     let value = tx.query_row(
         "SELECT id, name, latitude, longitude, radius, cost_per_unit, session_fee, billing_type
          FROM geofences WHERE id=?1",
@@ -114,10 +112,6 @@ pub fn save(conn: &mut Connection, id: Option<i64>, input: GeofenceInput) -> Res
 pub fn delete(conn: &mut Connection, id: i64) -> Result<bool> {
     let tx = conn.transaction()?;
     let removed = tx.execute("DELETE FROM geofences WHERE id=?1", [id])? > 0;
-    if removed {
-        reassign(&tx)?;
-        recalculate_costs(&tx)?;
-    }
     tx.commit()?;
     Ok(removed)
 }
