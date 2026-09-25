@@ -99,7 +99,11 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
         )
         .optional()?;
 
-    let pos = latest_position(conn, car_id)?;
+    let pos = latest_position(conn, car_id, false)?;
+    // Streaming positions can omit charge data. Keep the newest position for
+    // location and motion, but take battery values from the last reading that
+    // actually included a battery level.
+    let battery_pos = latest_position(conn, car_id, true)?;
     let detail = snap
         .as_ref()
         .and_then(|(_, _, _, json)| json.as_ref())
@@ -135,7 +139,7 @@ pub fn live_view(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Valu
 
     let battery = battery_block(
         detail.as_ref(),
-        pos.as_ref(),
+        battery_pos.as_ref(),
         length_unit,
         &preferred,
         &mut extras,
@@ -220,14 +224,15 @@ struct Pos {
     defrost_rear: Option<i64>,
 }
 
-fn latest_position(conn: &Connection, car_id: i64) -> rusqlite::Result<Option<Pos>> {
+fn latest_position(conn: &Connection, car_id: i64, require_battery: bool) -> rusqlite::Result<Option<Pos>> {
     conn.query_row(
         "SELECT battery_level, usable_battery_level, rated_battery_range_km, ideal_battery_range_km,
                 est_battery_range_km, outside_temp, inside_temp, latitude, longitude, speed, power,
                 odometer, tpms_pressure_fl, tpms_pressure_fr, tpms_pressure_rl, tpms_pressure_rr,
                 elevation, passenger_temp_setting, is_front_defroster_on, is_rear_defroster_on
-         FROM positions WHERE car_id=?1 ORDER BY date DESC LIMIT 1",
-        [car_id],
+         FROM positions WHERE car_id=?1 AND (?2=0 OR battery_level IS NOT NULL)
+         ORDER BY date DESC LIMIT 1",
+        params![car_id, require_battery as i64],
         |r| {
             Ok(Pos {
                 battery_level: r.get(0)?,
@@ -782,6 +787,27 @@ mod tests {
         assert!((view["odometer"].as_f64().unwrap() - 100.0).abs() < 0.05);
         assert!((view["battery"]["range"].as_f64().unwrap() - 100.0).abs() < 0.05);
         assert!((view["tires"]["fl"]["pressure"].as_f64().unwrap() - 42.1).abs() < 0.15);
+    }
+
+    #[test]
+    fn offline_view_uses_last_measured_battery_after_sparse_stream_position() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO positions (date, latitude, longitude, battery_level, car_id)
+             VALUES ('2026-09-25 17:51:50', 51.5, -0.1, 85, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO positions (date, latitude, longitude, battery_level, car_id)
+             VALUES ('2026-09-25 17:53:08', 51.6, -0.2, NULL, 1)",
+            [],
+        )
+        .unwrap();
+        record_snapshot(&conn, 1, "offline", None).unwrap();
+        let view = live_view(&conn, 1).unwrap().unwrap();
+        assert_eq!(view["battery"]["level"], json!(85));
+        assert_eq!(view["drive"]["lat"], json!(51.6));
     }
 
     #[test]

@@ -112,7 +112,7 @@ tr.row-warn:hover td, tr.row-bad:hover td { filter: brightness(1.12); }
 .hm-grid i.on { background: #e85d04; }
 
 #board.grouped { height: auto !important; padding: 12px 16px 48px; }
-#board.grouped .panel.flow { position: relative; left: auto; top: auto; width: auto; height: auto; }
+#board.grouped .panel.flow { position: relative; left: auto; top: auto; width: auto; height: auto; container-type: inline-size; }
 .meta-lead { color: var(--muted); margin: 0 0 16px; max-width: 68ch; }
 .meta-section { margin: 0 0 22px; }
 .meta-section > h2 { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 4px 0 10px; font-weight: 600; }

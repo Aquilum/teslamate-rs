@@ -12,6 +12,63 @@ let currentMeta = "vehicle";
 let liveTimer = null;
 const dashCache = new Map();
 const META_IDS = new Set(["vehicle", "battery", "trips", "software"]);
+const QUERY_CLIENT_CONCURRENCY = 3;
+let queryActive = 0;
+const queryQueue = [];
+
+function queryAbortError() {
+  const err = new Error("aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function acquireQuerySlot(signal) {
+  if (signal?.aborted) return Promise.reject(queryAbortError());
+  if (queryActive < QUERY_CLIENT_CONCURRENCY) {
+    queryActive++;
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const entry = { resolve, reject, signal };
+    entry.onAbort = () => {
+      const i = queryQueue.indexOf(entry);
+      if (i >= 0) {
+        queryQueue.splice(i, 1);
+        reject(queryAbortError());
+      }
+    };
+    signal?.addEventListener("abort", entry.onAbort, { once: true });
+    queryQueue.push(entry);
+  });
+}
+
+function releaseQuerySlot() {
+  while (queryQueue.length) {
+    const entry = queryQueue.shift();
+    entry.signal?.removeEventListener("abort", entry.onAbort);
+    if (entry.signal?.aborted) {
+      entry.reject(queryAbortError());
+      continue;
+    }
+    entry.resolve();
+    return;
+  }
+  queryActive--;
+}
+
+async function dashboardQuery(q, signal) {
+  await acquireQuerySlot(signal);
+  try {
+    return await api("/api/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(q),
+      signal,
+    });
+  } finally {
+    releaseQuerySlot();
+  }
+}
 
 function isAbort(e) {
   return !!(e && (e.name === "AbortError" || e.code === 20));
@@ -263,12 +320,7 @@ function attachIds(q, sql) {
 
 async function queryPanelSql(sql, v, panel, ctl, extra = {}) {
   const q = attachIds({ sql, ...withPanelTime(v, panel), ...extra }, sql);
-  const data = await api("/api/query", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(q),
-    signal: ctl.signal,
-  });
+  const data = await dashboardQuery(q, ctl.signal);
   if (stale(ctl) || (data && data.cancelled)) {
     const err = new Error("aborted");
     err.name = "AbortError";
@@ -356,12 +408,7 @@ async function fillPanel(body, panel, v, ctl = {}, dash = currentDash) {
         if (params.get("charging_process_id")) q.charging_process_id = Number(params.get("charging_process_id"));
       }
       try {
-        const data = await api("/api/query", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(q),
-          signal: ctl.signal,
-        });
+        const data = await dashboardQuery(q, ctl.signal);
         if (ctl.gen != null && ctl.gen !== dashGen) return;
         if (data && data.cancelled) return;
         results.push(data);
@@ -2055,8 +2102,8 @@ function paintLive(host, data) {
     .filter(Boolean)
     .filter((v, i, a) => a.indexOf(v) === i)
     .join(" · ");
-  const level = Number(b.level);
-  const limit = Number(b.limit);
+  const level = b.level == null ? NaN : Number(b.level);
+  const limit = b.limit == null ? NaN : Number(b.limit);
   const charging = b.chargingState && !/disconnected|complete|stopped/i.test(b.chargingState);
   const driving = d.shift && /^(D|R|N)$/.test(d.shift);
   const chips = [];
