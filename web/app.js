@@ -2536,7 +2536,7 @@ async function loadLocationsPage(board, signal) {
     const map = L.map(mapEl).setView(data.center || [54, -2], locations.length ? 12 : 6);
     osmTiles().addTo(map);
     mapEl._map = map;
-    const savedLayers = L.layerGroup().addTo(map);
+    const savedLayers = L.featureGroup().addTo(map);
     let preview = null;
     let editing = null;
     const form = board.querySelector("#location-form");
