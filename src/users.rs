@@ -6,9 +6,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const SESSION_DAYS: i64 = 30;
 const INVITE_DAYS: i64 = 7;
 const WEBAUTHN_MINUTES: i64 = 10;
+const INVITE_UNUSED_MAX_DEFAULT: i64 = 20;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,11 +172,13 @@ pub fn insert_user_with_invite(
     uuid: Option<&str>,
 ) -> Result<User, Box<dyn std::error::Error>> {
     with_immediate(conn, || {
-        if get_user_by_username(conn, username)?.is_some() {
-            return Err("username is taken".into());
-        }
+        // Validate the invite before revealing whether a username exists — otherwise
+        // unauthenticated callers can probe accounts with any garbage invite token.
         if peek_invite(conn, invite)?.is_none() {
             return Err("invite is invalid or expired".into());
+        }
+        if get_user_by_username(conn, username)?.is_some() {
+            return Err("username is taken".into());
         }
         let user = insert_user_with_uuid(conn, username, password_hash, false, uuid)?;
         if !consume_invite(conn, invite, user.id)? {
@@ -186,16 +188,55 @@ pub fn insert_user_with_invite(
     })
 }
 
+const SESSION_DAYS_DEFAULT: i64 = 7;
+const SESSION_IDLE_HOURS_DEFAULT: i64 = 24;
+const SESSION_MAX_PER_USER_DEFAULT: i64 = 10;
+
+pub fn session_days() -> i64 {
+    std::env::var("TESLAMATE_RS_SESSION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_DAYS_DEFAULT)
+        .clamp(1, 90)
+}
+
+pub fn session_idle_hours() -> i64 {
+    std::env::var("TESLAMATE_RS_SESSION_IDLE_HOURS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_IDLE_HOURS_DEFAULT)
+        .clamp(1, 24 * 30)
+}
+
+pub fn session_max_per_user() -> i64 {
+    std::env::var("TESLAMATE_RS_SESSION_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(SESSION_MAX_PER_USER_DEFAULT)
+        .clamp(1, 100)
+}
+
 pub fn create_session(
     conn: &Connection,
     user_id: i64,
     token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expires = (Utc::now() + Duration::days(SESSION_DAYS)).to_rfc3339();
+    let now = Utc::now();
+    let expires = (now + Duration::days(session_days())).to_rfc3339();
+    let seen = now.to_rfc3339();
     conn.execute(
-        "INSERT INTO sessions (token_hash, user_id, expires_at, created_at)
-         VALUES (?1, ?2, ?3, datetime('now'))",
-        params![hash_secret(token), user_id, expires],
+        "INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_seen)
+         VALUES (?1, ?2, ?3, datetime('now'), ?4)",
+        params![hash_secret(token), user_id, expires, seen],
+    )?;
+    // Cap concurrent sessions per user (oldest absolute expiry / created first).
+    let max = session_max_per_user();
+    conn.execute(
+        "DELETE FROM sessions WHERE user_id=?1 AND rowid NOT IN (
+            SELECT rowid FROM sessions WHERE user_id=?1
+            ORDER BY created_at DESC, rowid DESC LIMIT ?2
+         )",
+        params![user_id, max],
     )?;
     Ok(())
 }
@@ -205,17 +246,35 @@ pub fn user_from_session(
     token: &str,
 ) -> Result<Option<User>, Box<dyn std::error::Error>> {
     let hash = hash_secret(token);
-    let now = Utc::now().to_rfc3339();
-    conn.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now])?;
-    Ok(conn
+    let now = Utc::now();
+    let now_s = now.to_rfc3339();
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?1", [&now_s])?;
+    let idle_cut = (now - Duration::hours(session_idle_hours())).to_rfc3339();
+    conn.execute(
+        "DELETE FROM sessions WHERE last_seen IS NOT NULL AND last_seen < ?1",
+        [&idle_cut],
+    )?;
+    // Legacy rows without last_seen: treat created_at as last_seen for idle.
+    conn.execute(
+        "DELETE FROM sessions WHERE last_seen IS NULL AND created_at < ?1",
+        [&idle_cut],
+    )?;
+    let user = conn
         .query_row(
             "SELECT u.id, u.uuid, u.username, u.password_hash, u.is_admin
              FROM sessions s JOIN users u ON u.id = s.user_id
              WHERE s.token_hash=?1 AND s.expires_at >= ?2",
-            params![hash, now],
+            params![hash, now_s],
             map_user,
         )
-        .optional()?)
+        .optional()?;
+    if user.is_some() {
+        conn.execute(
+            "UPDATE sessions SET last_seen=?1 WHERE token_hash=?2",
+            params![now_s, hash],
+        )?;
+    }
+    Ok(user)
 }
 
 pub fn delete_session(conn: &Connection, token: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -224,6 +283,14 @@ pub fn delete_session(conn: &Connection, token: &str) -> Result<(), Box<dyn std:
         [hash_secret(token)],
     )?;
     Ok(())
+}
+
+pub fn delete_sessions_for_user(
+    conn: &Connection,
+    user_id: i64,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let n = conn.execute("DELETE FROM sessions WHERE user_id=?1", [user_id])?;
+    Ok(n)
 }
 
 pub fn store_webauthn_challenge(
@@ -361,11 +428,36 @@ pub fn delete_passkey(
     Ok(n > 0)
 }
 
+pub fn invite_unused_max() -> i64 {
+    std::env::var("TESLAMATE_RS_INVITE_UNUSED_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(INVITE_UNUSED_MAX_DEFAULT)
+        .clamp(1, 200)
+}
+
+pub fn count_unused_invites(conn: &Connection) -> Result<i64, Box<dyn std::error::Error>> {
+    let now = Utc::now().to_rfc3339();
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM invites WHERE used_by IS NULL AND expires_at >= ?1",
+        [&now],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn create_invite(
     conn: &Connection,
     created_by: i64,
     token: &str,
 ) -> Result<InviteInfo, Box<dyn std::error::Error>> {
+    let unused = count_unused_invites(conn)?;
+    let max = invite_unused_max();
+    if unused >= max {
+        return Err(format!(
+            "too many unused invites ({unused}); redeem or wait for expiry (max {max})"
+        )
+        .into());
+    }
     let expires = (Utc::now() + Duration::days(INVITE_DAYS)).to_rfc3339();
     conn.execute(
         "INSERT INTO invites (token_hash, created_by, expires_at, created_at)
@@ -491,6 +583,35 @@ mod tests {
     }
 
     #[test]
+    fn register_hides_usernames_without_valid_invite() {
+        let conn = mem();
+        let admin = create_first_admin(&conn, "admin", Some("hash"), None).unwrap();
+        insert_user(&conn, "alice", Some("hash"), false).unwrap();
+        let err_taken = insert_user_with_invite(&conn, "alice", Some("hash"), "bogus", None)
+            .unwrap_err()
+            .to_string();
+        let err_fresh = insert_user_with_invite(&conn, "bob", Some("hash"), "bogus", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_taken.contains("invite"),
+            "existing user must not leak via bad invite: {err_taken}"
+        );
+        assert!(
+            err_fresh.contains("invite"),
+            "unknown user must not differ from existing: {err_fresh}"
+        );
+        assert_eq!(err_taken, err_fresh);
+
+        let token = "real-invite";
+        create_invite(&conn, admin.id, token).unwrap();
+        let taken = insert_user_with_invite(&conn, "alice", Some("hash"), token, None)
+            .unwrap_err()
+            .to_string();
+        assert!(taken.contains("taken"), "{taken}");
+    }
+
+    #[test]
     fn session_roundtrip() {
         let conn = mem();
         let user = insert_user(&conn, "tom", Some("hash"), true).unwrap();
@@ -499,5 +620,46 @@ mod tests {
         assert_eq!(got.username, "tom");
         delete_session(&conn, "secret").unwrap();
         assert!(user_from_session(&conn, "secret").unwrap().is_none());
+    }
+
+    #[test]
+    fn session_cap_evicts_oldest() {
+        let conn = mem();
+        let user = insert_user(&conn, "tom", Some("hash"), true).unwrap();
+        let prev = std::env::var("TESLAMATE_RS_SESSION_MAX").ok();
+        std::env::set_var("TESLAMATE_RS_SESSION_MAX", "2");
+        create_session(&conn, user.id, "a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        create_session(&conn, user.id, "b").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        create_session(&conn, user.id, "c").unwrap();
+        match prev {
+            Some(v) => std::env::set_var("TESLAMATE_RS_SESSION_MAX", v),
+            None => std::env::remove_var("TESLAMATE_RS_SESSION_MAX"),
+        }
+        assert!(user_from_session(&conn, "a").unwrap().is_none());
+        assert!(user_from_session(&conn, "b").unwrap().is_some());
+        assert!(user_from_session(&conn, "c").unwrap().is_some());
+        assert_eq!(delete_sessions_for_user(&conn, user.id).unwrap(), 2);
+        assert!(user_from_session(&conn, "c").unwrap().is_none());
+    }
+
+    #[test]
+    fn unused_invite_cap_blocks_minting() {
+        let conn = mem();
+        let admin = create_first_admin(&conn, "admin", Some("hash"), None).unwrap();
+        let prev = std::env::var("TESLAMATE_RS_INVITE_UNUSED_MAX").ok();
+        std::env::set_var("TESLAMATE_RS_INVITE_UNUSED_MAX", "2");
+        create_invite(&conn, admin.id, "one").unwrap();
+        create_invite(&conn, admin.id, "two").unwrap();
+        let err = create_invite(&conn, admin.id, "three")
+            .unwrap_err()
+            .to_string();
+        match prev {
+            Some(v) => std::env::set_var("TESLAMATE_RS_INVITE_UNUSED_MAX", v),
+            None => std::env::remove_var("TESLAMATE_RS_INVITE_UNUSED_MAX"),
+        }
+        assert!(err.contains("too many unused"), "{err}");
+        assert_eq!(count_unused_invites(&conn).unwrap(), 2);
     }
 }

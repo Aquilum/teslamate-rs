@@ -20,6 +20,10 @@ pub fn import_tokens(
     user: &str,
     dbname: &str,
 ) -> Result<Tokens> {
+    crate::docker_util::validate_docker_ident("db container", db_container)?;
+    crate::docker_util::validate_docker_ident("app container", app_container)?;
+    crate::docker_util::validate_docker_ident("user", user)?;
+    crate::docker_util::validate_docker_ident("dbname", dbname)?;
     let key_material = docker_stdout(app_container, &["printenv", "ENCRYPTION_KEY"])
         .context("read ENCRYPTION_KEY from TeslaMate app container")?;
     let key_material = key_material.trim();

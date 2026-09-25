@@ -108,6 +108,196 @@ fn parse_interval(s: &str) -> i64 {
     }
 }
 
+/// Tables that must never be reachable from dashboard `/api/query`.
+pub const FORBIDDEN_QUERY_TABLES: &[&str] = &[
+    "oauth_tokens",
+    "users",
+    "sessions",
+    "invites",
+    "webauthn_credentials",
+    "webauthn_challenges",
+    "audit_log",
+];
+
+/// Clamp client-controlled Grafana vars to values that are safe to splice into SQL.
+pub fn sanitize_vars(mut vars: QueryVars) -> QueryVars {
+    vars.length_unit = allow_enum(&vars.length_unit, &["km", "mi"], "km");
+    vars.temp_unit = allow_enum(&vars.temp_unit, &["C", "F"], "C");
+    vars.preferred_range = allow_enum(&vars.preferred_range, &["ideal", "rated"], "rated");
+    vars.pressure_unit = allow_enum(&vars.pressure_unit, &["bar", "psi"], "bar");
+    vars.speed_unit = allow_enum(&vars.speed_unit, &["kmh", "mph"], "kmh");
+    vars.period = allow_enum(
+        &vars.period,
+        &["hour", "day", "week", "month", "year"],
+        "month",
+    );
+    vars.interval = sanitize_interval(&vars.interval);
+    vars.charge_type = "%".into();
+    let mut extras = HashMap::new();
+    for (k, v) in vars.extras.drain() {
+        if !safe_ident(&k) || FORBIDDEN_QUERY_TABLES.iter().any(|t| t.eq_ignore_ascii_case(&k)) {
+            continue;
+        }
+        // URL search params are mirrored into extras; only accept literal-safe values.
+        if let Some(v) = sanitize_extra_value(&k, &v) {
+            extras.insert(k, v);
+        }
+    }
+    vars.extras = extras;
+    vars
+}
+
+fn allow_enum(raw: &str, allowed: &[&str], default: &str) -> String {
+    let t = raw.trim();
+    allowed
+        .iter()
+        .find(|a| a.eq_ignore_ascii_case(t))
+        .copied()
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn sanitize_interval(raw: &str) -> String {
+    let t = raw.trim();
+    if Regex::new(r"^[0-9]{1,6}(ms|s|m|h|d|w)?$")
+        .unwrap()
+        .is_match(t)
+    {
+        t.to_string()
+    } else {
+        "1h".into()
+    }
+}
+
+fn safe_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_') && s.len() <= 64
+}
+
+/// Double-quote a SQLite identifier after validating it is a safe ASCII name.
+pub fn quote_ident(name: &str) -> Option<String> {
+    if !safe_ident(name) {
+        return None;
+    }
+    Some(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
+fn sanitize_extra_value(key: &str, raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.len() > 64 {
+        return None;
+    }
+    match key {
+        "length_unit" => Some(allow_enum(t, &["km", "mi"], "km")),
+        "temp_unit" => Some(allow_enum(t, &["C", "F"], "C")),
+        "preferred_range" => Some(allow_enum(t, &["ideal", "rated"], "rated")),
+        "pressure_unit" => Some(allow_enum(t, &["bar", "psi"], "bar")),
+        "speed_unit" => Some(allow_enum(t, &["kmh", "mph"], "kmh")),
+        "period" => Some(allow_enum(
+            t,
+            &["hour", "day", "week", "month", "year"],
+            "month",
+        )),
+        "car_id" | "drive_id" | "charging_process_id" => {
+            if t.chars().all(|c| c.is_ascii_digit()) && t.len() <= 18 {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        }
+        _ => {
+            if t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%' | ':'))
+            {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Reject non-SELECT statements and references to auth / token tables.
+pub fn assert_safe_dashboard_sql(sql: &str) -> Result<(), String> {
+    let stripped = strip_sql_comments(sql);
+    for part in stripped.split(';') {
+        let stmt = part.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let head = stmt
+            .chars()
+            .take(12)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !(head.starts_with("select") || head.starts_with("with")) {
+            return Err("only SELECT queries are allowed".into());
+        }
+        if head.contains("attach") || stmt.to_ascii_lowercase().contains(" attach ") {
+            return Err("ATTACH is not allowed".into());
+        }
+    }
+    let lower = stripped.to_ascii_lowercase();
+    for table in FORBIDDEN_QUERY_TABLES {
+        let re = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(table))).map_err(|e| e.to_string())?;
+        if re.is_match(&lower) {
+            return Err(format!("query must not reference {table}"));
+        }
+    }
+    Ok(())
+}
+
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_single {
+            out.push(c);
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            in_single = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 pub fn translate(sql: &str, vars: &QueryVars) -> String {
     let mut s = sql.to_string();
     s = expand_vars(&s, vars);
@@ -1118,6 +1308,8 @@ fn rewrite_greatest(sql: &str) -> String {
     s
 }
 
+/// Telemetry tables only — auth / token tables are omitted so database-info
+/// dashboards cannot probe them via the rewritten catalog queries.
 const SQLITE_USER_TABLES: &[&str] = &[
     "addresses",
     "car_settings",
@@ -1127,17 +1319,11 @@ const SQLITE_USER_TABLES: &[&str] = &[
     "charging_processes",
     "drives",
     "geofences",
-    "invites",
-    "oauth_tokens",
     "position_hourly",
     "positions",
-    "sessions",
     "settings",
     "states",
     "updates",
-    "users",
-    "webauthn_challenges",
-    "webauthn_credentials",
 ];
 
 fn sqlite_row_counts_sql() -> String {
@@ -1677,5 +1863,40 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn query_guard_blocks_token_and_auth_tables() {
+        assert!(assert_safe_dashboard_sql("SELECT * FROM positions").is_ok());
+        assert!(assert_safe_dashboard_sql("SELECT access_token FROM oauth_tokens").is_err());
+        assert!(assert_safe_dashboard_sql("WITH u AS (SELECT * FROM users) SELECT * FROM u").is_err());
+        assert!(assert_safe_dashboard_sql("DELETE FROM positions").is_err());
+        assert!(assert_safe_dashboard_sql("ATTACH DATABASE '/tmp/x' AS x").is_err());
+    }
+
+    #[test]
+    fn quote_ident_rejects_unsafe_names() {
+        assert_eq!(quote_ident("cars").as_deref(), Some("\"cars\""));
+        assert_eq!(quote_ident("oauth_tokens").as_deref(), Some("\"oauth_tokens\""));
+        assert!(quote_ident("").is_none());
+        assert!(quote_ident("cars; DROP TABLE users").is_none());
+        assert!(quote_ident("1cars").is_none());
+        assert!(quote_ident("car-s").is_none());
+    }
+
+    #[test]
+    fn sanitize_vars_clamps_units_and_extras() {
+        let mut v = vars();
+        v.length_unit = "km'; DROP TABLE users;--".into();
+        v.period = "month'; DROP TABLE cars;--".into();
+        v.extras.insert("period".into(), "year'; waitfor delay".into());
+        v.extras.insert("evil".into(), "1'; DROP TABLE cars;--".into());
+        v.extras.insert("drive_id".into(), "42".into());
+        let clean = sanitize_vars(v);
+        assert_eq!(clean.length_unit, "km");
+        assert_eq!(clean.period, "month");
+        assert_eq!(clean.extras.get("drive_id").map(String::as_str), Some("42"));
+        assert!(!clean.extras.contains_key("evil"));
+        assert!(!clean.extras.contains_key("period") || clean.extras["period"] == "month");
     }
 }

@@ -22,9 +22,16 @@ impl Db {
         self.write.lock()
     }
 
-    /// WAL reader. Concurrent dashboard queries use different connections.
+    /// WAL reader (`query_only`). Concurrent dashboard queries use different connections.
+    /// Production `open()` always installs at least one reader so this never touches the
+    /// writable connection. `from_write` (tests) may fall back to the write handle.
     pub fn read(&self) -> MutexGuard<'_, Connection> {
         if self.reads.is_empty() {
+            #[cfg(not(test))]
+            panic!(
+                "teslamate-rs: read pool is empty; dashboard queries must not use the write connection"
+            );
+            #[cfg(test)]
             return self.write.lock();
         }
         let i = self.cursor.fetch_add(1, Ordering::Relaxed) % self.reads.len();
@@ -78,19 +85,25 @@ pub fn open(path: &Path) -> Result<Db> {
         tracing::warn!("position_hourly backfill: {e:#}");
     }
     let mut reads = Vec::new();
+    // Always keep at least one query_only reader so dashboard `/api/query`
+    // never falls back to the writable connection.
     let n = std::env::var("TESLAMATE_RS_READ_POOL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(READ_POOL)
-        .clamp(0, 8);
-    if n > 0 {
-        for i in 0..n {
-            match open_conn(path, false) {
-                Ok(c) => {
-                    let _ = c.pragma_update(None, "query_only", true);
-                    reads.push(Mutex::new(c));
+        .clamp(1, 8);
+    for i in 0..n {
+        match open_conn(path, false) {
+            Ok(c) => {
+                c.pragma_update(None, "query_only", true)
+                    .with_context(|| format!("enable query_only on read pool slot {i}"))?;
+                reads.push(Mutex::new(c));
+            }
+            Err(e) => {
+                if reads.is_empty() {
+                    return Err(e).with_context(|| format!("open read pool slot {i}"));
                 }
-                Err(e) => tracing::warn!("read pool slot {i}: {e:#}"),
+                tracing::warn!("read pool slot {i}: {e:#}");
             }
         }
     }
@@ -111,6 +124,8 @@ fn open_conn(path: &Path, apply_schema: bool) -> Result<Connection> {
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     if apply_schema {
         conn.execute_batch(include_str!("../schema.sql"))?;
+        // Older DBs created sessions without last_seen.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT", []);
     }
     register_functions(&conn)?;
     Ok(conn)

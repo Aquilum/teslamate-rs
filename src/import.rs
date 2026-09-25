@@ -41,6 +41,9 @@ pub struct ImportOpts {
 }
 
 pub fn import_from_docker(conn: &mut Connection, opts: &ImportOpts) -> Result<()> {
+    crate::docker_util::validate_docker_ident("container", &opts.docker)?;
+    crate::docker_util::validate_docker_ident("user", &opts.user)?;
+    crate::docker_util::validate_docker_ident("dbname", &opts.dbname)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "cache_size", "-262144")?; // 256 MB
