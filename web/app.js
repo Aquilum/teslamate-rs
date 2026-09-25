@@ -191,11 +191,11 @@ function renderNav() {
   $("nav-list").innerHTML = Object.entries(folders)
     .map(
       ([folder, items]) =>
-        `<h2>${folder}</h2>` +
+        `<h2>${escapeHtml(folder)}</h2>` +
         items
           .map(
             (d) =>
-              `<a href="#${d.path}" data-path="${d.path}" class="${d.path === currentPath ? "active" : ""}">${d.title}</a>`
+              `<a href="#${escapeHtml(d.path)}" data-path="${escapeHtml(d.path)}" class="${d.path === currentPath ? "active" : ""}">${escapeHtml(d.title)}</a>`
           )
           .join("")
     )
@@ -450,7 +450,31 @@ function prettyCol(c) {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+/** Allow only simple CSS color tokens for inline style sinks. */
+function safeCssColor(c) {
+  const s = String(c ?? "").trim();
+  if (!s || s === "transparent") return "";
+  if (/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s)) return s;
+  if (/^rgba?\(\s*[\d.%\s,]+\s*\)$/i.test(s)) return s;
+  if (/^hsla?\(\s*[\d.%\s,/]+\s*\)$/i.test(s)) return s;
+  if (/^[a-z]{1,20}$/i.test(s)) return s.toLowerCase();
+  if (/^var\(--[a-z0-9-]+\)$/i.test(s)) return s;
+  return "";
+}
+
+function styleColor(c) {
+  const color = safeCssColor(c);
+  return color ? `color:${color}` : "";
+}
+
+function styleBg(c) {
+  const color = safeCssColor(c);
+  return color ? `background:${color}` : "";
 }
 
 function organizeOpts(panel) {
@@ -928,7 +952,8 @@ function drawTable(body, panel, cols, rows) {
         return `<tr${attrs}>${headers
           .map((c) => {
             const cell = formatCell(panel, c, r[c]);
-            const st = cell.color && cell.color !== "transparent" ? ` style="color:${cell.color};font-weight:600"` : "";
+            const color = styleColor(cell.color);
+            const st = color ? ` style="${color};font-weight:600"` : "";
             return `<td${st}>${escapeHtml(cell.text)}</td>`;
           })
           .join("")}</tr>`;
@@ -1088,7 +1113,8 @@ function drawStat(body, panel, cols, rows, type) {
   const untitled = !String(panel.title || "").trim();
   const showName = textMode === "value_and_name" || textMode === "name" || (textMode === "auto" && untitled);
   const htmlFor = (it, named) => {
-    const color = it.mapped?.color ? ` style="color:${it.mapped.color}"` : "";
+    const colorCss = styleColor(it.mapped?.color);
+    const color = colorCss ? ` style="${colorCss}"` : "";
     const name = named && it.name ? `<span class="stat-name">${escapeHtml(it.name)}</span>` : "";
     const unit = it.unit ? `<span class="stat-unit">${escapeHtml(it.unit)}</span>` : "";
     return `<div class="stat"${color}>${name}<span class="stat-val">${escapeHtml(it.text || "–")}</span>${unit}</div>`;
@@ -1107,7 +1133,7 @@ function drawStat(body, panel, cols, rows, type) {
     const pct = isPercentUnit(unit, it.col, n)
       ? Math.max(0, Math.min(100, n <= 1.5 ? n * 100 : n))
       : Math.max(0, Math.min(100, n));
-    body.innerHTML += `<div class="gauge-bar"><span style="width:${pct}%;background:${it.mapped.color || "var(--accent)"}"></span></div>`;
+    body.innerHTML += `<div class="gauge-bar"><span style="width:${pct}%;${styleBg(it.mapped.color) || styleBg("var(--accent)")}"></span></div>`;
   }
 }
 
@@ -1199,7 +1225,7 @@ function drawStateTimeline(el, panel, cols, rows) {
     const x = ((s.start - from) / span) * w;
     const sw = Math.max(1.5, ((s.end - s.start) / span) * w);
     const m = mapValue(panel, s.v);
-    const fill = m.color || "#8b93a7";
+    const fill = safeCssColor(m.color) || "#8b93a7";
     const tc = luminance(fill) > 0.55 ? "#111217" : "#f4f6fb";
     const label = sw > 44 ? m.text : "";
     const title = `${m.text} · ${formatTime(s.start)} – ${formatTime(s.end)}`;
@@ -1226,7 +1252,10 @@ function drawStateTimeline(el, panel, cols, rows) {
     if (!seen.has(m.text)) seen.set(m.text, m.color || "#8b93a7");
   }
   const legend = [...seen.entries()]
-    .map(([name, color]) => `<span class="tl-swatch"><i style="background:${color}"></i>${escapeHtml(name)}</span>`)
+    .map(([name, color]) => {
+      const bg = styleBg(color);
+      return `<span class="tl-swatch"><i${bg ? ` style="${bg}"` : ""}></i>${escapeHtml(name)}</span>`;
+    })
     .join("");
   el.innerHTML = parts.join("") + `<div class="tl-legend">${legend}</div>`;
 }
@@ -1357,7 +1386,8 @@ function drawBarGauge(el, panel, cols, rows) {
       const pct = n == null ? 0 : Math.max(0, Math.min(100, (n / max) * 100));
       const label = r[nameCol] == null ? "" : String(r[nameCol]);
       const color = thresholdColor(panel.fieldConfig?.defaults?.thresholds?.steps, n) || "var(--accent)";
-      return `<div class="bg-row"><span class="bg-name">${escapeHtml(label)}</span><div class="bg-track"><span style="width:${pct}%;background:${color}"></span></div><span class="bg-val">${escapeHtml(n == null ? "" : formatNum(n))}</span></div>`;
+      const bg = styleBg(color);
+      return `<div class="bg-row"><span class="bg-name">${escapeHtml(label)}</span><div class="bg-track"><span style="width:${pct}%;${bg}"></span></div><span class="bg-val">${escapeHtml(n == null ? "" : formatNum(n))}</span></div>`;
     })
     .join("")}</div>`;
 }
@@ -1437,7 +1467,7 @@ function drawPieChart(el, panel, cols, rows) {
   slices.forEach((s, i) => {
     const sweep = (s.v / total) * Math.PI * 2;
     const a1 = a + sweep;
-    const color = sliceColor(panel, s.name, i);
+    const color = safeCssColor(sliceColor(panel, s.name, i)) || "#8b93a7";
     const pct = (s.v / total) * 100;
     const tip = `${s.name}: ${formatPieValue(panel, s.v, valCol)} (${pct.toFixed(1)}%)`;
     paths.push(`<path d="${piePath(cx, cy, r, a, a1)}" fill="${color}"><title>${escapeHtml(tip)}</title></path>`);
@@ -1458,7 +1488,8 @@ function drawPieChart(el, panel, cols, rows) {
     ? `<div class="pie-legend">${slices
         .map((s, i) => {
           const pct = (s.v / total) * 100;
-          return `<div class="pie-leg"><i style="background:${sliceColor(panel, s.name, i)}"></i><b>${escapeHtml(s.name)}</b><span>${escapeHtml(formatPieValue(panel, s.v, valCol))}</span><span>${pct.toFixed(1)}%</span></div>`;
+          const legBg = styleBg(sliceColor(panel, s.name, i));
+          return `<div class="pie-leg"><i${legBg ? ` style="${legBg}"` : ""}></i><b>${escapeHtml(s.name)}</b><span>${escapeHtml(formatPieValue(panel, s.v, valCol))}</span><span>${pct.toFixed(1)}%</span></div>`;
         })
         .join("")}</div>`
     : "";
@@ -2446,7 +2477,14 @@ async function boot() {
   settings = await api("/api/settings");
   cars = await api("/api/cars");
   dashboards = await api("/api/dashboards");
-  $("car").innerHTML = cars.map((c) => `<option value="${c.id}">${c.name || "car " + c.id}</option>`).join("");
+  const carSel = $("car");
+  carSel.replaceChildren();
+  for (const c of cars) {
+    const opt = document.createElement("option");
+    opt.value = String(c.id);
+    opt.textContent = c.name || "car " + c.id;
+    carSel.appendChild(opt);
+  }
   syncHashToLayout();
   renderNav();
   document.querySelectorAll(".presets button").forEach((b) =>

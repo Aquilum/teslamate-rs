@@ -7,6 +7,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
+use std::net::SocketAddr;
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
@@ -53,42 +54,54 @@ impl AuthState {
         })
     }
 
-    pub fn session_cookie(&self, token: &str, headers: &HeaderMap) -> Cookie<'static> {
+    pub fn session_cookie(
+        &self,
+        token: &str,
+        headers: &HeaderMap,
+        peer: Option<SocketAddr>,
+    ) -> Cookie<'static> {
         apply_cookie(
             Cookie::new(SESSION_COOKIE, token.to_owned()),
-            self.secure_from(headers),
+            self.secure_from(headers, peer),
         )
     }
 
-    pub fn wa_cookie(&self, id: &str, headers: &HeaderMap) -> Cookie<'static> {
-        apply_cookie(Cookie::new(WA_COOKIE, id.to_owned()), self.secure_from(headers))
+    pub fn wa_cookie(&self, id: &str, headers: &HeaderMap, peer: Option<SocketAddr>) -> Cookie<'static> {
+        apply_cookie(
+            Cookie::new(WA_COOKIE, id.to_owned()),
+            self.secure_from(headers, peer),
+        )
     }
 
-    pub fn session_cookie_key(&self, headers: &HeaderMap) -> Cookie<'static> {
-        apply_cookie(Cookie::from(SESSION_COOKIE), self.secure_from(headers))
+    pub fn session_cookie_key(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Cookie<'static> {
+        apply_cookie(
+            Cookie::from(SESSION_COOKIE),
+            self.secure_from(headers, peer),
+        )
     }
 
-    pub fn wa_cookie_key(&self, headers: &HeaderMap) -> Cookie<'static> {
-        apply_cookie(Cookie::from(WA_COOKIE), self.secure_from(headers))
+    pub fn wa_cookie_key(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> Cookie<'static> {
+        apply_cookie(Cookie::from(WA_COOKIE), self.secure_from(headers, peer))
     }
 
-    pub fn secure_from(&self, headers: &HeaderMap) -> bool {
-        self.secure_cookie || public_origin(headers, &self.origin).starts_with("https://")
+    pub fn secure_from(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> bool {
+        self.secure_cookie || public_origin(headers, &self.origin, peer).starts_with("https://")
     }
 
-    pub fn origin_from(&self, headers: &HeaderMap) -> String {
-        public_origin(headers, &self.origin)
+    pub fn origin_from(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+        public_origin(headers, &self.origin, peer)
     }
 
-    pub fn rp_id_from(&self, headers: &HeaderMap) -> String {
-        rp_id_for_origin(&self.origin_from(headers)).unwrap_or_else(|_| self.rp_id.clone())
+    pub fn rp_id_from(&self, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+        rp_id_for_origin(&self.origin_from(headers, peer)).unwrap_or_else(|_| self.rp_id.clone())
     }
 
     pub fn webauthn_from(
         &self,
         headers: &HeaderMap,
+        peer: Option<SocketAddr>,
     ) -> Result<Webauthn, Box<dyn std::error::Error>> {
-        let origin = self.origin_from(headers);
+        let origin = self.origin_from(headers, peer);
         let rp_id = rp_id_for_origin(&origin)?;
         let url = Url::parse(&origin)?;
         Ok(WebauthnBuilder::new(&rp_id, &url)?
@@ -97,36 +110,64 @@ impl AuthState {
     }
 }
 
-pub fn public_origin(headers: &HeaderMap, fallback: &str) -> String {
+/// Honor `X-Forwarded-Proto` only from loopback peers (same rule as rate-limit IP).
+pub fn trust_forwarded_proto(peer: Option<SocketAddr>) -> bool {
+    trust_proxy() && peer.map(|p| p.ip().is_loopback()).unwrap_or(false)
+}
+
+pub fn public_origin(headers: &HeaderMap, fallback: &str, peer: Option<SocketAddr>) -> String {
     if let Ok(forced) = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN") {
         if !forced.is_empty() {
             return forced.trim_end_matches('/').to_string();
         }
     }
+    // Never honor client-controlled X-Forwarded-Host for cookie/WebAuthn origin.
+    // Reverse proxies should set Host to the public hostname; pin
+    // TESLAMATE_RS_WEBAUTHN_ORIGIN when that is not reliable.
     let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
+        .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if fallback.starts_with("https://") {
-                "https"
-            } else {
-                "http"
-            }
-        });
+    let proto = if trust_forwarded_proto(peer) {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if fallback.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                }
+            })
+    } else if fallback.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
     if let Some(host) = host {
         return format!("{proto}://{host}");
     }
     fallback.trim_end_matches('/').to_string()
+}
+
+/// Honor `X-Forwarded-*` / `X-Real-IP` only when explicitly enabled (or when the
+/// WebAuthn origin is pinned, which implies a trusted reverse proxy).
+pub fn trust_proxy() -> bool {
+    match std::env::var("TESLAMATE_RS_TRUST_PROXY") {
+        Ok(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some(),
+    }
 }
 
 fn rp_id_for_origin(origin: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -146,7 +187,7 @@ fn apply_cookie(mut cookie: Cookie<'static>, secure: bool) -> Cookie<'static> {
     cookie.set_http_only(true);
     cookie.set_path("/");
     cookie.set_same_site(SameSite::Strict);
-    cookie.set_max_age(time::Duration::days(30));
+    cookie.set_max_age(time::Duration::days(crate::users::session_days()));
     if secure {
         cookie.set_secure(true);
     }
@@ -236,7 +277,13 @@ pub async fn pam_provision_user(
         })
         .await
         .map_err(internal_err)?;
-        if exists && !member {
+        if !exists {
+            tracing::error!(
+                "PAM group {group} does not exist; refusing sign-in until it is created"
+            );
+            return Err(denied());
+        }
+        if !member {
             return Err(denied());
         }
     }
@@ -372,6 +419,11 @@ pub fn hash_password(password: &str) -> Result<String, Box<dyn std::error::Error
         .to_string())
 }
 
+/// Argon2id hash of a fixed dummy password (salt `teslamate-rs-dummy!!`).
+/// Used so unknown-user / passkey-only logins still pay the verify cost.
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$dGVzbGFtYXRlLXJzLWR1bW15ISE$PCo3YFlzCkMv+knY186or6Uk3ov0icPGI4sD7wABr6Q";
+
 pub fn verify_password(password: &str, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
@@ -381,17 +433,25 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+/// Always runs Argon2 verify (against `hash` or a dummy) so callers cannot
+/// distinguish missing users from bad passwords via response timing.
+pub fn verify_password_or_dummy(password: &str, hash: Option<&str>) -> bool {
+    let effective = hash.unwrap_or(DUMMY_PASSWORD_HASH);
+    verify_password(password, effective) && hash.is_some()
+}
+
 pub fn issue_session(
     jar: CookieJar,
     state: &AuthState,
     db: &Db,
     user_id: i64,
     headers: &HeaderMap,
+    peer: Option<SocketAddr>,
 ) -> Result<CookieJar, Box<dyn std::error::Error>> {
     let token = random_token();
     let conn = db.lock();
     users::create_session(&conn, user_id, &token)?;
-    Ok(jar.add(state.session_cookie(&token, headers)))
+    Ok(jar.add(state.session_cookie(&token, headers, peer)))
 }
 
 #[allow(dead_code)]
@@ -450,12 +510,26 @@ pub fn user_can_drop_passkey(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn password_hash_roundtrip() {
         let hash = hash_password("correct horse").unwrap();
         assert!(verify_password("correct horse", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn login_verify_always_checks_argon2() {
+        assert!(!verify_password_or_dummy("anything1", None));
+        let hash = hash_password("correct horse").unwrap();
+        assert!(verify_password_or_dummy("correct horse", Some(&hash)));
+        assert!(!verify_password_or_dummy("wrong pass", Some(&hash)));
+        // Dummy hash must itself be a valid Argon2 PHC string.
+        assert!(PasswordHash::new(DUMMY_PASSWORD_HASH).is_ok());
+        assert!(!verify_password("correct horse", DUMMY_PASSWORD_HASH));
     }
 
     #[test]
@@ -470,26 +544,124 @@ mod tests {
 
     #[test]
     fn origin_follows_nginx_forwarded_https() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "tm.example.com".parse().unwrap());
-        headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
-        let origin = public_origin(&headers, "http://localhost:4010");
+        // Nginx should pass the public Host; X-Forwarded-Host alone is ignored.
+        headers.insert(header::HOST, "tm.example.com".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        let peer: SocketAddr = "127.0.0.1:4010".parse().unwrap();
+        let origin = public_origin(&headers, "http://localhost:4010", Some(peer));
         assert_eq!(origin, "https://tm.example.com");
         let state = AuthState::new("localhost", "http://localhost:4010").unwrap();
-        assert!(state.secure_from(&headers));
-        assert_eq!(state.rp_id_from(&headers), "tm.example.com");
+        assert!(state.secure_from(&headers, Some(peer)));
+        assert_eq!(state.rp_id_from(&headers, Some(peer)), "tm.example.com");
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
+    }
+
+    #[test]
+    fn forwarded_host_ignored_even_with_trust_proxy() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
+        let peer: SocketAddr = "127.0.0.1:4010".parse().unwrap();
+        assert_eq!(
+            public_origin(&headers, "http://localhost:4010", Some(peer)),
+            "https://127.0.0.1:4010"
+        );
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
+    }
+
+    #[test]
+    fn forwarded_proto_ignored_from_non_loopback_peer() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::set_var("TESLAMATE_RS_TRUST_PROXY", "1");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert(header::HOST, "tm.example.com".parse().unwrap());
+        let peer: SocketAddr = "192.0.2.1:4010".parse().unwrap();
+        assert_eq!(
+            public_origin(&headers, "http://localhost:4010", Some(peer)),
+            "http://tm.example.com"
+        );
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
+    }
+
+    #[test]
+    fn forwarded_headers_ignored_without_trust_proxy() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_trust = std::env::var("TESLAMATE_RS_TRUST_PROXY").ok();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::remove_var("TESLAMATE_RS_TRUST_PROXY");
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        headers.insert(header::HOST, "127.0.0.1:4010".parse().unwrap());
+        assert_eq!(
+            public_origin(&headers, "http://localhost:4010", None),
+            "http://127.0.0.1:4010"
+        );
+        match prev_trust {
+            Some(v) => std::env::set_var("TESLAMATE_RS_TRUST_PROXY", v),
+            None => std::env::remove_var("TESLAMATE_RS_TRUST_PROXY"),
+        }
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
     }
 
     #[test]
     fn origin_header_is_ignored() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_origin = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN").ok();
+        std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN");
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
         headers.insert(header::HOST, "mate.lan".parse().unwrap());
         assert_eq!(
-            public_origin(&headers, "http://localhost:4010"),
+            public_origin(&headers, "http://localhost:4010", None),
             "http://mate.lan"
         );
+        match prev_origin {
+            Some(v) => std::env::set_var("TESLAMATE_RS_WEBAUTHN_ORIGIN", v),
+            None => std::env::remove_var("TESLAMATE_RS_WEBAUTHN_ORIGIN"),
+        }
     }
 
     #[test]

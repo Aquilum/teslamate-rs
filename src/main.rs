@@ -1,19 +1,23 @@
 mod app_state;
+mod audit;
 mod auth;
 mod auth_http;
 mod db;
 mod detail;
+mod docker_util;
 mod import;
 mod invoices;
 mod live;
 mod logger;
 mod mock;
 mod pam_auth;
+mod query_allowlist;
 mod refresh;
 mod seed;
 mod server;
 mod sql;
 mod tesla;
+mod token_crypto;
 mod tokens;
 mod users;
 
@@ -112,6 +116,7 @@ fn point_at_mock(bind: &str, mock_port: u16) {
         format!("ws://{bind}:{mock_port}/streaming/"),
     );
     std::env::set_var("TESLAMATE_RS_POLL_SECS", "1");
+    std::env::set_var("TESLAMATE_RS_ALLOW_INSECURE_TESLA", "1");
 }
 
 async fn probe(db: &db::Db) -> Result<()> {

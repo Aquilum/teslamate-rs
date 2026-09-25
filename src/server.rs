@@ -1,9 +1,9 @@
-use crate::app_state::{App, AuthLimiter, QueryCache};
-use crate::auth::{AuthState, AuthUser, PasswordBackend};
+use crate::app_state::{App, AuthLimiter, QueryCache, QueryGate};
+use crate::auth::{AdminUser, AuthState, AuthUser, PasswordBackend};
 use crate::db::Db;
 use crate::sql::{self, QueryVars};
 use anyhow::Result;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower_http::trace::TraceLayer;
 
 #[derive(RustEmbed)]
@@ -28,6 +28,39 @@ struct Web;
 #[derive(RustEmbed)]
 #[folder = "dashboards/"]
 struct Dashboards;
+
+const DEFAULT_QUERY_MAX_ROWS: usize = 50_000;
+const DEFAULT_QUERY_TIMEOUT_MS: u64 = 15_000;
+
+fn query_max_rows() -> usize {
+    std::env::var("TESLAMATE_RS_QUERY_MAX_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_MAX_ROWS)
+        .clamp(100, 500_000)
+}
+
+fn query_timeout() -> Duration {
+    let ms = std::env::var("TESLAMATE_RS_QUERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS)
+        .clamp(500, 120_000);
+    Duration::from_millis(ms)
+}
+
+pub fn setup_allowed_for_bind(bind: SocketAddr) -> bool {
+    if bind.ip().is_loopback() {
+        return true;
+    }
+    matches!(
+        std::env::var("TESLAMATE_RS_ALLOW_SETUP")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
 
 pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) -> Result<()> {
     let origin = if bind.ip().is_loopback() {
@@ -52,20 +85,32 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
             tracing::info!("password backend: PAM (service={service}, {group})");
             if let Some(group) = crate::pam_auth::required_group() {
                 if !crate::pam_auth::group_exists(&group) {
-                    tracing::warn!(
-                        "group {group} does not exist yet; any PAM-authenticated user can sign in until you create it"
+                    tracing::error!(
+                        "group {group} does not exist; PAM sign-in is refused until you create it and add members"
                     );
                 }
             }
         }
         PasswordBackend::Local => tracing::info!("password backend: local (SQLite argon2)"),
     }
+    let setup_allowed = setup_allowed_for_bind(bind);
+    if !setup_allowed {
+        tracing::info!(
+            "first-admin setup locked (non-loopback bind); set TESLAMATE_RS_ALLOW_SETUP=1 to unlock"
+        );
+    }
+    tracing::info!(
+        "dashboard SQL allowlist: {} templates",
+        crate::query_allowlist::len()
+    );
     let state = App {
         db,
         auth,
         password_backend,
         limiter: AuthLimiter::default(),
         query_cache: QueryCache::default(),
+        query_gate: QueryGate::default(),
+        setup_allowed,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -81,16 +126,84 @@ pub async fn serve(db: Db, bind: SocketAddr, password_backend: PasswordBackend) 
         .route("/api/dbinfo", get(dbinfo))
         .merge(crate::auth_http::router())
         .route("/{*path}", get(static_file))
+        .layer(middleware::from_fn(csrf_guard))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
         .layer(TraceLayer::new_for_http());
     tracing::info!("teslamate-rs listening on http://{bind}");
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
+async fn csrf_guard(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let mutating = matches!(
+        method.as_str(),
+        "POST" | "PUT" | "PATCH" | "DELETE"
+    );
+    if mutating {
+        let has_session = req
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.contains(crate::auth::SESSION_COOKIE));
+        if has_session && !csrf_origin_ok(req.headers()) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "ok": false, "error": "cross-origin request blocked" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn csrf_origin_ok(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        if site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none") {
+            return true;
+        }
+        if site.eq_ignore_ascii_case("cross-site") {
+            return false;
+        }
+    }
+    let expected = crate::auth::public_origin(headers, "", None);
+    if expected.is_empty() {
+        return true;
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        return origin_matches(origin, &expected);
+    }
+    if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+        return url::Url::parse(referer)
+            .ok()
+            .is_some_and(|url| origin_matches(url.origin().ascii_serialization().as_str(), &expected));
+    }
+    // Browser fetch to same origin usually sends Origin; allow missing for non-browser clients on loopback-style Host.
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| h.starts_with("127.0.0.1") || h.starts_with("localhost"))
+}
+
+fn origin_matches(origin: &str, expected: &str) -> bool {
+    origin.trim_end_matches('/') == expected.trim_end_matches('/')
+}
+
 async fn security_headers(req: Request, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let https = request_is_https(req.headers(), peer);
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
     headers.insert(
@@ -109,7 +222,46 @@ async fn security_headers(req: Request, next: Next) -> Response {
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'",
         ),
     );
+    if https {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
     res
+}
+
+fn request_is_https(headers: &axum::http::HeaderMap, peer: Option<SocketAddr>) -> bool {
+    if let Ok(origin) = std::env::var("TESLAMATE_RS_WEBAUTHN_ORIGIN") {
+        if origin.starts_with("https://") {
+            return true;
+        }
+    }
+    if crate::auth::trust_forwarded_proto(peer) {
+        return headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    }
+    false
+}
+
+/// Reject traversal tricks before rust-embed lookups.
+pub fn safe_embed_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
+}
+
+fn dashboard_path_allowed(path: &str) -> bool {
+    safe_embed_path(path) && path.ends_with(".json") && !path.starts_with("internal/")
 }
 
 async fn index() -> impl IntoResponse {
@@ -120,6 +272,9 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn static_file(Path(path): Path<String>) -> Response {
+    if !safe_embed_path(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match Web::get(&path) {
         Some(f) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
@@ -306,6 +461,9 @@ async fn list_dashboards(_user: AuthUser) -> Json<Vec<DashMeta>> {
 }
 
 async fn get_dashboard(_user: AuthUser, Path(path): Path<String>) -> Response {
+    if !dashboard_path_allowed(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match Dashboards::get(&path) {
         Some(f) => (
             [(header::CONTENT_TYPE, "application/json")],
@@ -382,13 +540,29 @@ fn execute_dashboard_query(
     sql: String,
     mut vars: QueryVars,
     cancelled: &Arc<AtomicBool>,
+    enforce_allowlist: bool,
+    actor: Option<String>,
 ) -> Value {
     if cancelled.load(Ordering::Relaxed) {
         return cancelled_json();
     }
+    if enforce_allowlist && !crate::query_allowlist::is_allowed(&sql) {
+        let preview: String = sql.chars().take(120).collect();
+        crate::audit::record(
+            db,
+            actor.as_deref(),
+            "query_denied",
+            &format!("not in dashboard allowlist: {preview}"),
+        );
+        return json!({
+            "ok": false,
+            "error": "query is not an allowed dashboard template",
+        });
+    }
     if let Some(payload) = query_stats_override(&sql, cache) {
         return payload;
     }
+    vars = sql::sanitize_vars(vars);
     if sql.contains("$aux") && !vars.extras.contains_key("aux") {
         let conn = db.read();
         if cancelled.load(Ordering::Relaxed) {
@@ -399,11 +573,26 @@ fn execute_dashboard_query(
         drop(conn);
         vars.extras.insert("aux".into(), aux);
     }
-    let translated =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sql::translate(&sql, &vars)))
-            .unwrap_or_else(|_| sql.clone());
+    let translated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sql::translate(&sql, &vars)
+    }))
+    .unwrap_or_else(|_| sql.clone());
+    if let Err(msg) = sql::assert_safe_dashboard_sql(&translated) {
+        crate::audit::record(
+            db,
+            actor.as_deref(),
+            "query_blocked",
+            &msg,
+        );
+        return json!({
+            "ok": false,
+            "error": msg,
+        });
+    }
     let key = cache_key(&translated);
     let t0 = Instant::now();
+    let deadline = t0 + query_timeout();
+    let max_rows = query_max_rows();
     if let Some(hit) = cache.get(key) {
         cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
         return hit;
@@ -416,7 +605,9 @@ fn execute_dashboard_query(
         return cancelled_json();
     }
     let flag = cancelled.clone();
-    conn.progress_handler(250, Some(move || flag.load(Ordering::Relaxed)));
+    conn.progress_handler(250, Some(move || {
+        flag.load(Ordering::Relaxed) || Instant::now() >= deadline
+    }));
     let _clear = ClearProgress(&conn);
     let mut stmt = match conn.prepare(&translated) {
         Ok(s) => s,
@@ -424,11 +615,8 @@ fn execute_dashboard_query(
             return cancelled_json();
         }
         Err(e) => {
-            return json!({
-                "ok": false,
-                "error": e.to_string(),
-                "sql": translated,
-            });
+            tracing::warn!("query prepare failed: {e}; sql={}", preview_sql_log(&translated));
+            return json!({ "ok": false, "error": "query failed" });
         }
     };
     let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
@@ -439,16 +627,29 @@ fn execute_dashboard_query(
             return cancelled_json();
         }
         Err(e) => {
-            return json!({
-                "ok": false,
-                "error": e.to_string(),
-                "sql": translated,
-            });
+            tracing::warn!("query start failed: {e}; sql={}", preview_sql_log(&translated));
+            return json!({ "ok": false, "error": "query failed" });
         }
     };
+    let mut truncated = false;
     loop {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "query timed out after {}ms; sql={}",
+                query_timeout().as_millis(),
+                preview_sql_log(&translated)
+            );
+            return json!({
+                "ok": false,
+                "error": format!("query timed out after {}ms", query_timeout().as_millis()),
+            });
+        }
         match mapped.next() {
             Ok(Some(row)) => {
+                if rows.len() >= max_rows {
+                    truncated = true;
+                    break;
+                }
                 let mut obj = serde_json::Map::new();
                 for (i, name) in names.iter().enumerate() {
                     match row.get_ref(i) {
@@ -457,11 +658,8 @@ fn execute_dashboard_query(
                         }
                         Err(e) if is_interrupt(&e) => return cancelled_json(),
                         Err(e) => {
-                            return json!({
-                                "ok": false,
-                                "error": e.to_string(),
-                                "sql": translated,
-                            });
+                            tracing::warn!("query row failed: {e}");
+                            return json!({ "ok": false, "error": "query failed" });
                         }
                     }
                 }
@@ -472,11 +670,8 @@ fn execute_dashboard_query(
                 return cancelled_json();
             }
             Err(e) => {
-                return json!({
-                    "ok": false,
-                    "error": e.to_string(),
-                    "sql": translated,
-                });
+                tracing::warn!("query iterate failed: {e}");
+                return json!({ "ok": false, "error": "query failed" });
             }
         }
     }
@@ -491,18 +686,49 @@ fn execute_dashboard_query(
         "ok": true,
         "columns": names,
         "rows": rows,
-        "sql": translated,
+        "truncated": truncated,
+        "maxRows": max_rows,
     });
-    cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
-    cache.put(key, payload.clone());
+    if !truncated {
+        cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
+        cache.put(key, payload.clone());
+    } else {
+        cache.record_exec(&translated, t0.elapsed().as_secs_f64() * 1000.0);
+    }
     payload
 }
 
+fn preview_sql_log(sql: &str) -> String {
+    sql.chars().take(160).collect::<String>().replace('\n', " ")
+}
+
 async fn run_query(
-    _user: AuthUser,
+    user: AuthUser,
     State(app): State<App>,
     Json(body): Json<QueryBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
+    let rate_key = format!("query:{}", user.id);
+    if !app.limiter.allow_budget(
+        &rate_key,
+        crate::app_state::query_rate_max(),
+        crate::app_state::query_rate_window(),
+    ) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "ok": false, "error": "query rate limit exceeded" })),
+        )
+            .into_response());
+    }
+    let _permits = match app.query_gate.try_acquire(user.id).await {
+        Ok(p) => p,
+        Err(()) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "ok": false, "error": "too many queries" })),
+            )
+                .into_response());
+        }
+    };
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(cancelled.clone());
     let db = app.db.clone();
@@ -510,11 +736,13 @@ async fn run_query(
     let sql = body.sql;
     let vars = body.vars;
     let flag = cancelled.clone();
-    let payload =
-        tokio::task::spawn_blocking(move || execute_dashboard_query(&db, &cache, sql, vars, &flag))
-            .await
-            .map_err(|e| AppError(anyhow::anyhow!("query task: {e}")))?;
-    Ok(Json(payload))
+    let actor = Some(user.username.clone());
+    let payload = tokio::task::spawn_blocking(move || {
+        execute_dashboard_query(&db, &cache, sql, vars, &flag, true, actor)
+    })
+    .await
+    .map_err(|e| AppError(anyhow::anyhow!("query task: {e}")))?;
+    Ok(Json(payload).into_response())
 }
 
 fn sqlite_to_json(v: ValueRef) -> Value {
@@ -527,7 +755,7 @@ fn sqlite_to_json(v: ValueRef) -> Value {
     }
 }
 
-async fn dbinfo(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
+async fn dbinfo(_admin: AdminUser, State(app): State<App>) -> Result<Json<Value>, AppError> {
     spawn_db(app.db.clone(), |conn| {
         let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
         let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
@@ -539,7 +767,20 @@ async fn dbinfo(_user: AuthUser, State(app): State<App>) -> Result<Json<Value>, 
             .collect::<rusqlite::Result<_>>()?;
         let mut tables = Vec::new();
         for name in names {
-            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |r| r.get(0))?;
+            if sql::FORBIDDEN_QUERY_TABLES
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            let Some(quoted) = sql::quote_ident(&name) else {
+                continue;
+            };
+            let n: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM {quoted}"),
+                [],
+                |r| r.get(0),
+            )?;
             tables.push(json!({ "name": name, "rows": n }));
         }
         Ok(Json(json!({
@@ -564,9 +805,10 @@ impl From<anyhow::Error> for AppError {
 }
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        tracing::error!("teslamate-rs api: {:#}", self.0);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "ok": false, "error": self.0.to_string() })),
+            Json(json!({ "ok": false, "error": "internal error" })),
         )
             .into_response()
     }
@@ -590,6 +832,8 @@ mod query_cancel_tests {
             "select 1 as n".into(),
             vars(),
             &cancelled,
+            false,
+            None,
         );
         assert_eq!(v["cancelled"], json!(true));
     }
@@ -599,11 +843,120 @@ mod query_cancel_tests {
         let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
         let cache = QueryCache::default();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let v = execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
+        let v = execute_dashboard_query(
+            &db,
+            &cache,
+            "select 1 as n".into(),
+            vars(),
+            &cancelled,
+            false,
+            None,
+        );
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["rows"][0]["n"], json!(1));
-        let again =
-            execute_dashboard_query(&db, &cache, "select 1 as n".into(), vars(), &cancelled);
+        let again = execute_dashboard_query(
+            &db,
+            &cache,
+            "select 1 as n".into(),
+            vars(),
+            &cancelled,
+            false,
+            None,
+        );
         assert_eq!(again["ok"], json!(true));
+    }
+
+    #[test]
+    fn query_rejects_oauth_tokens_table() {
+        let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let v = execute_dashboard_query(
+            &db,
+            &QueryCache::default(),
+            "SELECT access_token, refresh_token FROM oauth_tokens".into(),
+            vars(),
+            &cancelled,
+            false,
+            Some("admin".into()),
+        );
+        assert_eq!(v["ok"], json!(false));
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("oauth_tokens"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn query_rejects_unlisted_sql_when_allowlist_on() {
+        let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let v = execute_dashboard_query(
+            &db,
+            &QueryCache::default(),
+            "select 1 as n".into(),
+            vars(),
+            &cancelled,
+            true,
+            Some("guest".into()),
+        );
+        assert_eq!(v["ok"], json!(false));
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("allowed dashboard"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn query_allows_preview_track_template() {
+        let db = crate::db::Db::from_write(Connection::open_in_memory().unwrap());
+        {
+            let conn = db.lock();
+            conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let v = execute_dashboard_query(
+            &db,
+            &QueryCache::default(),
+            crate::query_allowlist::PREVIEW_TRACK_SQL.into(),
+            vars(),
+            &cancelled,
+            true,
+            Some("admin".into()),
+        );
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn embed_paths_reject_traversal() {
+        assert!(safe_embed_path("app.js"));
+        assert!(safe_embed_path("reports/dutch-tax.json"));
+        assert!(!safe_embed_path(""));
+        assert!(!safe_embed_path("/app.js"));
+        assert!(!safe_embed_path("../index.html"));
+        assert!(!safe_embed_path("foo/../bar.json"));
+        assert!(dashboard_path_allowed("overview.json"));
+        assert!(!dashboard_path_allowed("internal/hidden.json"));
+        assert!(!dashboard_path_allowed("overview.json/.."));
+    }
+
+    #[test]
+    fn csrf_referer_requires_matching_origin() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::HOST, "localhost:4010".parse().unwrap());
+        headers.insert(header::REFERER, "http://localhost:4010.evil.example/page".parse().unwrap());
+        assert!(!csrf_origin_ok(&headers));
+        headers.insert(header::REFERER, "http://localhost:4010/page".parse().unwrap());
+        assert!(csrf_origin_ok(&headers));
     }
 }

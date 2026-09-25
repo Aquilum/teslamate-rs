@@ -3,17 +3,18 @@
 use crate::app_state::App;
 use crate::auth::{
     self, api_err, hash_password, internal_err, issue_session, normalize_username, pam_provision_user,
-    passkeys_of, session_token_from_jar, store_passkey, update_stored_passkey, verify_password,
+    passkeys_of, session_token_from_jar, store_passkey, update_stored_passkey, verify_password_or_dummy,
     AdminUser, AuthUser, OptionalUser, PasswordBackend, WA_COOKIE,
 };
 use crate::users::{self, User};
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
@@ -24,6 +25,7 @@ pub fn router() -> Router<App> {
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/logout-all", post(auth_logout_all))
         .route("/api/auth/webauthn/register/start", post(wa_register_start))
         .route("/api/auth/webauthn/register/finish", post(wa_register_finish))
         .route("/api/auth/webauthn/login/start", post(wa_login_start))
@@ -34,19 +36,29 @@ pub fn router() -> Router<App> {
         .route("/api/admin/invites", get(list_invites).post(create_invite))
 }
 
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("local")
-        .to_string()
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let peer_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
+    if auth::trust_proxy() && peer_loopback {
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_string();
+        }
+    }
+    peer.map(|p| p.ip().to_string())
+        .unwrap_or_else(|| "local".to_string())
 }
 
-fn rate_limit(app: &App, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
-    if app.limiter.allow(&client_ip(headers)) {
+fn rate_limit(
+    app: &App,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if app.limiter.allow(&client_ip(headers, peer)) {
         Ok(())
     } else {
         Err(api_err(
@@ -65,8 +77,12 @@ fn setup_conflict(err: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     }
 }
 
-fn request_webauthn(app: &App, headers: &HeaderMap) -> Result<Webauthn, (StatusCode, Json<Value>)> {
-    app.auth.webauthn_from(headers).map_err(|_| {
+fn request_webauthn(
+    app: &App,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<Webauthn, (StatusCode, Json<Value>)> {
+    app.auth.webauthn_from(headers, peer).map_err(|_| {
         api_err(
             StatusCode::BAD_REQUEST,
             "passkeys need the public HTTPS origin nginx advertises (Host + X-Forwarded-Proto)",
@@ -76,6 +92,7 @@ fn request_webauthn(app: &App, headers: &HeaderMap) -> Result<Webauthn, (StatusC
 
 async fn auth_status(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     user: OptionalUser,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -85,12 +102,13 @@ async fn auth_status(
     };
     let mut body = json!({
         "setupRequired": setup_required,
+        "setupAllowed": app.setup_allowed,
         "authenticated": user.0.is_some(),
         "passwordBackend": app.password_backend.as_str(),
         "registerEnabled": app.password_backend == PasswordBackend::Local,
         "webauthn": {
-            "rpId": app.auth.rp_id_from(&headers),
-            "origin": app.auth.origin_from(&headers),
+            "rpId": app.auth.rp_id_from(&headers, Some(peer)),
+            "origin": app.auth.origin_from(&headers, Some(peer)),
         },
     });
     if let Some(user) = user.0 {
@@ -120,11 +138,18 @@ struct UsernamePassword {
 
 async fn auth_setup(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
+    if !app.setup_allowed {
+        return Err(api_err(
+            StatusCode::FORBIDDEN,
+            "first-admin setup is locked; bind to loopback or set TESLAMATE_RS_ALLOW_SETUP=1",
+        ));
+    }
     {
         let conn = app.db.lock();
         if !users::setup_required(&conn).map_err(internal_err)? {
@@ -135,7 +160,8 @@ async fn auth_setup(
         let username = normalize_username(&body.username).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
         let password = body.password.unwrap_or_default();
         let user = pam_provision_user(&app.db, &username, &password).await?;
-        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+        crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (pam)");
         return Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))));
     }
     let username = normalize_username(&body.username).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
@@ -145,17 +171,19 @@ async fn auth_setup(
         let conn = app.db.lock();
         users::create_first_admin(&conn, &username, Some(&hash), None).map_err(setup_conflict)?
     };
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (local)");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
 async fn auth_register(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     if app.password_backend == PasswordBackend::Pam {
         return Err(api_err(
             StatusCode::BAD_REQUEST,
@@ -188,43 +216,50 @@ async fn auth_register(
             }
         })?
     };
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "register", "invite redeemed");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
 async fn auth_login(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<UsernamePassword>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     let username = normalize_username(&body.username).map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
     let password = body.password.unwrap_or_default();
     if app.password_backend == PasswordBackend::Pam {
         let user = pam_provision_user(&app.db, &username, &password).await?;
-        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+        let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+        crate::audit::record(&app.db, Some(&user.username), "login", "pam");
         return Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))));
     }
     let user = {
         let conn = app.db.lock();
         users::get_user_by_username(&conn, &username).map_err(internal_err)?
     };
-    let Some(user) = user else {
-        return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
-    };
-    let Some(hash) = user.password_hash.as_deref() else {
-        return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
-    };
-    if !verify_password(&password, hash) {
+    let hash = user.as_ref().and_then(|u| u.password_hash.as_deref());
+    if !verify_password_or_dummy(&password, hash) {
+        let detail = match &user {
+            None => "unknown user",
+            Some(u) if u.password_hash.is_none() => "no password",
+            _ => "bad password",
+        };
+        crate::audit::record(&app.db, Some(&username), "login_failed", detail);
         return Err(api_err(StatusCode::UNAUTHORIZED, "invalid username or password"));
     }
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let user = user.expect("verify_password_or_dummy requires a stored hash");
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "login", "local");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
 async fn auth_logout(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
@@ -233,8 +268,31 @@ async fn auth_logout(
         let _ = users::delete_session(&conn, &token);
     }
     Ok((
-        jar.remove(app.auth.session_cookie_key(&headers)),
+        jar.remove(app.auth.session_cookie_key(&headers, Some(peer))),
         Json(json!({ "ok": true })),
+    ))
+}
+
+async fn auth_logout_all(
+    user: AuthUser,
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
+    let n = {
+        let conn = app.db.lock();
+        users::delete_sessions_for_user(&conn, user.id).map_err(internal_err)?
+    };
+    crate::audit::record(
+        &app.db,
+        Some(&user.username),
+        "logout_all",
+        &format!("revoked {n} session(s)"),
+    );
+    Ok((
+        jar.remove(app.auth.session_cookie_key(&headers, Some(peer))),
+        Json(json!({ "ok": true, "revoked": n })),
     ))
 }
 
@@ -246,13 +304,14 @@ struct RegisterStart {
 
 async fn wa_register_start(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     user: OptionalUser,
     Json(body): Json<RegisterStart>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
     if user.0.is_none() {
-        rate_limit(&app, &headers)?;
+        rate_limit(&app, &headers, Some(peer))?;
     }
     let exclude: Option<Vec<CredentialID>> = None;
     let (purpose, user_id, username, invite_hash, uuid, display) = if let Some(user) = user.0 {
@@ -269,6 +328,12 @@ async fn wa_register_start(
         let conn = app.db.lock();
         users::setup_required(&conn).map_err(internal_err)?
     } {
+        if !app.setup_allowed {
+            return Err(api_err(
+                StatusCode::FORBIDDEN,
+                "first-admin setup is locked; bind to loopback or set TESLAMATE_RS_ALLOW_SETUP=1",
+            ));
+        }
         if app.password_backend == PasswordBackend::Pam {
             return Err(api_err(
                 StatusCode::BAD_REQUEST,
@@ -320,7 +385,7 @@ async fn wa_register_start(
     };
 
     let uuid_str = uuid.to_string();
-    let webauthn = request_webauthn(&app, &headers)?;
+    let webauthn = request_webauthn(&app, &headers, Some(peer))?;
     let (ccr, state) = webauthn
         .start_passkey_registration(uuid, &display, &display, exclude)
         .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -340,7 +405,7 @@ async fn wa_register_start(
         )
         .map_err(internal_err)?;
     }
-    let jar = jar.add(app.auth.wa_cookie(&challenge_id, &headers));
+    let jar = jar.add(app.auth.wa_cookie(&challenge_id, &headers, Some(peer)));
     Ok((jar, Json(serde_json::to_value(ccr).map_err(internal_err)?)))
 }
 
@@ -353,8 +418,10 @@ struct WebauthnFinish {
 
 async fn wa_register_finish(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
+    user: OptionalUser,
     Json(body): Json<WebauthnFinish>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
     let challenge_id = jar
@@ -370,20 +437,35 @@ async fn wa_register_finish(
         serde_json::from_str(&challenge.state_json).map_err(internal_err)?;
     let cred: RegisterPublicKeyCredential =
         serde_json::from_value(body.credential).map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let passkey = request_webauthn(&app, &headers)?
+    let passkey = request_webauthn(&app, &headers, Some(peer))?
         .finish_passkey_registration(&cred, &state)
         .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let mut jar = jar.remove(app.auth.wa_cookie_key(&headers));
+    let mut jar = jar.remove(app.auth.wa_cookie_key(&headers, Some(peer)));
     match challenge.purpose.as_str() {
         "add" => {
+            let session = user
+                .0
+                .ok_or_else(|| api_err(StatusCode::UNAUTHORIZED, "sign in required"))?;
             let user_id = challenge
                 .user_id
                 .ok_or_else(|| api_err(StatusCode::BAD_REQUEST, "not signed in"))?;
+            if session.id != user_id {
+                return Err(api_err(
+                    StatusCode::FORBIDDEN,
+                    "passkey challenge does not match this session",
+                ));
+            }
             store_passkey(&app.db, user_id, &passkey).map_err(internal_err)?;
             Ok((jar, Json(json!({ "ok": true }))))
         }
         "setup" => {
+            if !app.setup_allowed {
+                return Err(api_err(
+                    StatusCode::FORBIDDEN,
+                    "first-admin setup is locked; bind to loopback or set TESLAMATE_RS_ALLOW_SETUP=1",
+                ));
+            }
             {
                 let conn = app.db.lock();
                 if !users::setup_required(&conn).map_err(internal_err)? {
@@ -399,7 +481,8 @@ async fn wa_register_finish(
                     .map_err(setup_conflict)?
             };
             store_passkey(&app.db, user.id, &passkey).map_err(internal_err)?;
-            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+            crate::audit::record(&app.db, Some(&user.username), "setup", "first admin (passkey)");
             Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
         }
         "register" => {
@@ -426,7 +509,8 @@ async fn wa_register_finish(
                 .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?
             };
             store_passkey(&app.db, user.id, &passkey).map_err(internal_err)?;
-            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+            jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+            crate::audit::record(&app.db, Some(&user.username), "register", "invite redeemed (passkey)");
             Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
         }
         other => Err(api_err(
@@ -443,11 +527,12 @@ struct LoginStart {
 
 async fn wa_login_start(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<LoginStart>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     let failed = || api_err(StatusCode::UNAUTHORIZED, "passkey sign-in failed");
     let raw = body
         .username
@@ -465,7 +550,7 @@ async fn wa_login_start(
     if keys.is_empty() {
         return Err(failed());
     }
-    let (ccr, state) = request_webauthn(&app, &headers)?
+    let (ccr, state) = request_webauthn(&app, &headers, Some(peer))?
         .start_passkey_authentication(&keys)
         .map_err(|_| api_err(StatusCode::BAD_REQUEST, "passkey sign-in failed"))?;
     let state_json = serde_json::to_string(&state).map_err(internal_err)?;
@@ -485,18 +570,19 @@ async fn wa_login_start(
         .map_err(internal_err)?;
     }
     Ok((
-        jar.add(app.auth.wa_cookie(&challenge_id, &headers)),
+        jar.add(app.auth.wa_cookie(&challenge_id, &headers, Some(peer))),
         Json(serde_json::to_value(ccr).map_err(internal_err)?),
     ))
 }
 
 async fn wa_login_finish(
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<WebauthnFinish>,
 ) -> Result<(CookieJar, Json<Value>), (StatusCode, Json<Value>)> {
-    rate_limit(&app, &headers)?;
+    rate_limit(&app, &headers, Some(peer))?;
     let challenge_id = jar
         .get(WA_COOKIE)
         .map(|c| c.value().to_string())
@@ -510,7 +596,7 @@ async fn wa_login_finish(
         serde_json::from_value(body.credential).map_err(|_| api_err(StatusCode::BAD_REQUEST, "passkey sign-in failed"))?;
     let state: PasskeyAuthentication =
         serde_json::from_str(&challenge.state_json).map_err(internal_err)?;
-    let result = request_webauthn(&app, &headers)?
+    let result = request_webauthn(&app, &headers, Some(peer))?
         .finish_passkey_authentication(&cred, &state)
         .map_err(|_| api_err(StatusCode::UNAUTHORIZED, "passkey sign-in failed"))?;
     let user_id = challenge
@@ -524,8 +610,9 @@ async fn wa_login_finish(
     let keys = passkeys_of(&app.db, user.id).map_err(internal_err)?;
     apply_auth_result(&app, &user, &result, &keys)?;
 
-    let jar = jar.remove(app.auth.wa_cookie_key(&headers));
-    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers).map_err(internal_err)?;
+    let jar = jar.remove(app.auth.wa_cookie_key(&headers, Some(peer)));
+    let jar = issue_session(jar, &app.auth, &app.db, user.id, &headers, Some(peer)).map_err(internal_err)?;
+    crate::audit::record(&app.db, Some(&user.username), "login", "passkey");
     Ok((jar, Json(json!({ "ok": true, "user": AuthUser::from(&user) }))))
 }
 
@@ -617,12 +704,36 @@ async fn list_invites(admin: AdminUser, State(app): State<App>) -> Result<Json<V
 async fn create_invite(
     admin: AdminUser,
     State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Bound invite minting even for admins (stolen session / buggy UI).
+    rate_limit(&app, &headers, Some(peer))?;
+    let key = format!("invite:{}", admin.id);
+    if !app.limiter.allow_budget(&key, 30, std::time::Duration::from_secs(15 * 60)) {
+        return Err(api_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many invites, try later",
+        ));
+    }
     let token = auth::random_token();
     let info = {
         let conn = app.db.lock();
-        users::create_invite(&conn, admin.id, &token).map_err(internal_err)?
+        users::create_invite(&conn, admin.id, &token).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("too many unused") {
+                api_err(StatusCode::TOO_MANY_REQUESTS, msg)
+            } else {
+                internal_err(msg)
+            }
+        })?
     };
+    crate::audit::record(
+        &app.db,
+        Some(&admin.username),
+        "invite_create",
+        &format!("id={}", info.id),
+    );
     Ok(Json(json!({
         "id": info.id,
         "token": token,

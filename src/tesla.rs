@@ -124,20 +124,67 @@ pub struct Tesla {
     tokens: Tokens,
 }
 
+fn build_http_client() -> Result<Client> {
+    Ok(Client::builder()
+        .user_agent("teslamate-rs/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+fn insecure_tesla_ok() -> bool {
+    matches!(
+        std::env::var("TESLAMATE_RS_ALLOW_INSECURE_TESLA")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn host_allowed(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h == "owner-api.teslamotors.com"
+        || h == "auth.tesla.com"
+        || h == "streaming.vn.teslamotors.com"
+        || h == "akamai-apigateway-charging-ownership.tesla.com"
+        || h == "ownership.tesla.com"
+        || h.ends_with(".teslamotors.com")
+        || h.ends_with(".tesla.com")
+    {
+        return true;
+    }
+    if insecure_tesla_ok() && (h == "localhost" || h == "127.0.0.1" || h == "::1") {
+        return true;
+    }
+    false
+}
+
+pub fn assert_tesla_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).with_context(|| format!("parse url"))?;
+    let scheme = parsed.scheme();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("url missing host"))?;
+    match scheme {
+        "https" | "wss" => {}
+        "http" | "ws" if insecure_tesla_ok() && host_allowed(host) => {}
+        _ => bail!("refusing non-TLS Tesla URL ({scheme}://{host})"),
+    }
+    if !host_allowed(host) {
+        bail!("refusing Tesla API host {host:?}; set TESLAMATE_RS_ALLOW_INSECURE_TESLA=1 for local mocks");
+    }
+    Ok(())
+}
+
 impl Tesla {
     pub fn new(tokens: Tokens) -> Result<Self> {
-        let http = Client::builder()
-            .user_agent("teslamate-rs/0.1")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let http = build_http_client()?;
         Ok(Self { http, tokens })
     }
 
     pub async fn from_refresh_token(refresh_token: &str) -> Result<Self> {
-        let http = Client::builder()
-            .user_agent("teslamate-rs/0.1")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let http = build_http_client()?;
         let tokens = refresh_with(&http, refresh_token).await?;
         Ok(Self { http, tokens })
     }
@@ -273,6 +320,7 @@ impl Tesla {
     async fn get(&self, path: &str) -> Result<Value> {
         let label = redact_path(path);
         let url = format!("{}{path}", owner_api());
+        assert_tesla_url(&url)?;
         let resp = self
             .http
             .get(&url)
@@ -283,6 +331,9 @@ impl Tesla {
             .with_context(|| format!("GET {label}"))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status.is_redirection() {
+            bail!("GET {label} redirected ({status}); refusing to follow with bearer token");
+        }
         if !status.is_success() {
             bail!("GET {label} -> {status}");
         }
@@ -290,6 +341,7 @@ impl Tesla {
     }
 
     async fn get_url(&self, url: &str) -> Result<Value> {
+        assert_tesla_url(url)?;
         let resp = self
             .http
             .get(url)
@@ -300,6 +352,9 @@ impl Tesla {
             .context("GET charging-history")?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if status.is_redirection() {
+            bail!("GET charging-history redirected ({status}); refusing to follow with bearer token");
+        }
         if !status.is_success() {
             bail!("GET charging-history -> {status}");
         }
@@ -307,6 +362,7 @@ impl Tesla {
     }
 
     async fn post_url(&self, url: &str, body: &Value) -> Result<Value> {
+        assert_tesla_url(url)?;
         let resp = self
             .http
             .post(url)
@@ -318,6 +374,9 @@ impl Tesla {
             .context("POST charging-history")?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if status.is_redirection() {
+            bail!("POST charging-history redirected ({status}); refusing to follow with bearer token");
+        }
         if !status.is_success() {
             bail!("POST charging-history -> {status}");
         }
@@ -329,13 +388,19 @@ impl Tesla {
     }
 
     pub fn stream_url() -> String {
-        stream_endpoint()
+        let url = stream_endpoint();
+        if let Err(e) = assert_tesla_url(&url) {
+            tracing::error!("invalid TESLA_WSS_HOST: {e:#}");
+        }
+        url
     }
 }
 
 async fn refresh_with(http: &Client, refresh_token: &str) -> Result<Tokens> {
+    let url = auth_api();
+    assert_tesla_url(&url)?;
     let resp = http
-        .post(auth_api())
+        .post(&url)
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "client_id": "ownerapi",
@@ -346,6 +411,9 @@ async fn refresh_with(http: &Client, refresh_token: &str) -> Result<Tokens> {
         .context("token refresh")?;
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if status.is_redirection() {
+        bail!("token refresh redirected ({status}); refusing to follow");
+    }
     if !status.is_success() {
         bail!("token refresh {status}");
     }

@@ -9,6 +9,21 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
+/// Strip HTML/script-friendly punctuation from Tesla display names before storage.
+pub fn sanitize_vehicle_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | '"' | '\'' | '`' | '\\'))
+        .take(64)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "Vehicle".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn poll_secs() -> u64 {
     std::env::var("TESLAMATE_RS_POLL_SECS")
         .ok()
@@ -31,18 +46,37 @@ pub fn load_tokens(db: &Db) -> Result<Option<Tokens>> {
             "SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE id = 1",
             [],
             |r| {
-                Ok(Tokens {
-                    access_token: r.get(0)?,
-                    refresh_token: r.get(1)?,
-                    expires_at: r.get(2)?,
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             },
         )
         .optional()?;
-    Ok(row)
+    drop(conn);
+    let Some((access_enc, refresh_enc, expires_at)) = row else {
+        return Ok(None);
+    };
+    let access_token = crate::token_crypto::decrypt(&access_enc)?;
+    let refresh_token = crate::token_crypto::decrypt(&refresh_enc)?;
+    let tokens = Tokens {
+        access_token,
+        refresh_token,
+        expires_at,
+    };
+    // Migrate legacy plaintext rows to ciphertext on first read.
+    if !crate::token_crypto::is_encrypted(&access_enc)
+        || !crate::token_crypto::is_encrypted(&refresh_enc)
+    {
+        store_tokens(db, &tokens)?;
+    }
+    Ok(Some(tokens))
 }
 
 pub fn store_tokens(db: &Db, t: &Tokens) -> Result<()> {
+    let access = crate::token_crypto::encrypt(&t.access_token)?;
+    let refresh = crate::token_crypto::encrypt(&t.refresh_token)?;
     let conn = db.lock();
     conn.execute(
         "INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at, updated_at)
@@ -52,7 +86,7 @@ pub fn store_tokens(db: &Db, t: &Tokens) -> Result<()> {
            refresh_token = excluded.refresh_token,
            expires_at = excluded.expires_at,
            updated_at = excluded.updated_at",
-        params![t.access_token, t.refresh_token, t.expires_at],
+        params![access, refresh, t.expires_at],
     )?;
     Ok(())
 }
@@ -73,7 +107,7 @@ async fn upsert_vehicles(db: &Db, mut tesla: Tesla) -> Result<()> {
         let vid = tesla::i64_field(&p, &["id"]).context("vehicle id")?;
         let eid = tesla::i64_field(&p, &["vehicle_id"]).unwrap_or(vid);
         let vin = tesla::str_field(&p, &["vin"]).unwrap_or("").to_string();
-        let name = tesla::str_field(&p, &["display_name"]).map(|s| s.to_string());
+        let name = tesla::str_field(&p, &["display_name"]).map(|s| sanitize_vehicle_name(s));
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let conn = db.lock();
         let existing: Option<i64> = conn
@@ -474,4 +508,19 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_vehicle_name;
+
+    #[test]
+    fn strips_html_metacharacters_from_vehicle_names() {
+        assert_eq!(
+            sanitize_vehicle_name(r#"</option><img src=x onerror=alert(1)>"#),
+            "/optionimg src=x onerror=alert(1)"
+        );
+        assert_eq!(sanitize_vehicle_name("  Red S  "), "Red S");
+        assert_eq!(sanitize_vehicle_name("<<<"), "Vehicle");
+    }
 }
