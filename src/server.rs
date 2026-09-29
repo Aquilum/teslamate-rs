@@ -418,7 +418,7 @@ async fn list_geofences(
 }
 
 async fn create_geofence(
-    _user: AuthUser,
+    _admin: AdminUser,
     State(app): State<App>,
     Json(body): Json<crate::locations::GeofenceInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -438,7 +438,7 @@ async fn create_geofence(
 }
 
 async fn update_geofence(
-    _user: AuthUser,
+    _admin: AdminUser,
     State(app): State<App>,
     Path(id): Path<i64>,
     Json(body): Json<crate::locations::GeofenceInput>,
@@ -465,7 +465,7 @@ async fn update_geofence(
 }
 
 async fn delete_geofence(
-    _user: AuthUser,
+    _admin: AdminUser,
     State(app): State<App>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -485,7 +485,7 @@ async fn delete_geofence(
 }
 
 async fn rematch_geofences(
-    _user: AuthUser,
+    _admin: AdminUser,
     State(app): State<App>,
 ) -> Json<Value> {
     Json(json!({"ok": true, "job": app.location_jobs.start(app.db.clone())}))

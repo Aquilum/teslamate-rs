@@ -1,18 +1,19 @@
 [Unit]
 Description=teslamate-rs (TeslaMate dashboards + SQLite)
-After=network-online.target
+After=network-online.target teslamate-rs-pam.socket
 Wants=network-online.target
+Requires=teslamate-rs-pam.socket
 
 [Service]
 Type=simple
 User=teslamate-rs
 Group=teslamate-rs
-SupplementaryGroups=shadow
 WorkingDirectory=/srv/teslamate-rs
 Environment=TESLAMATE_RS_HOME=/srv/teslamate-rs
 Environment=TESLAMATE_RS_BIND=127.0.0.1
 Environment=TESLAMATE_RS_PORT=4010
 Environment=TESLAMATE_RS_AUTH=pam
+Environment=TESLAMATE_RS_PAM_SOCK=/run/teslamate-rs/pam.sock
 EnvironmentFile=-/etc/default/teslamate-rs
 ExecStart=/usr/bin/teslamate-rs serve --bind 127.0.0.1 --port 4010 --auth pam
 Restart=on-failure
@@ -48,3 +49,4 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
+Also=teslamate-rs-pam.socket

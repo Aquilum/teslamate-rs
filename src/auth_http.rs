@@ -546,6 +546,9 @@ async fn wa_login_start(
         users::get_user_by_username(&conn, &name).map_err(internal_err)?
     }
     .ok_or_else(failed)?;
+    if !auth::pam_access_allowed(&user.username, app.password_backend) {
+        return Err(failed());
+    }
     let keys = passkeys_of(&app.db, user.id).map_err(internal_err)?;
     if keys.is_empty() {
         return Err(failed());
@@ -607,6 +610,9 @@ async fn wa_login_finish(
         users::get_user_by_id(&conn, user_id).map_err(internal_err)?
     }
     .ok_or_else(|| api_err(StatusCode::UNAUTHORIZED, "passkey sign-in failed"))?;
+    if !auth::pam_access_allowed(&user.username, app.password_backend) {
+        return Err(api_err(StatusCode::UNAUTHORIZED, "passkey sign-in failed"));
+    }
     let keys = passkeys_of(&app.db, user.id).map_err(internal_err)?;
     apply_auth_result(&app, &user, &result, &keys)?;
 

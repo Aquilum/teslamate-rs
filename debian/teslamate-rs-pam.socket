@@ -1,0 +1,15 @@
+[Unit]
+Description=teslamate-rs PAM helper socket
+Before=teslamate-rs.service
+
+[Socket]
+ListenStream=/run/teslamate-rs/pam.sock
+SocketUser=teslamate-rs
+SocketGroup=teslamate-rs
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

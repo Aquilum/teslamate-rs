@@ -10,6 +10,11 @@ Service
   the Tesla Owner API logger until tokens are stored (teslamate-rs login).
   Override bind/port/database in /etc/default/teslamate-rs.
 
+  PAM password checks use a socket-activated one-shot helper running with
+  group shadow. The long-lived web daemon is not a member of shadow and
+  retains NoNewPrivileges=yes. On upgrades, postinst removes the old shadow
+  group membership before restarting the service.
+
   This package is meant to sit beside Docker TeslaMate (port 4000), not
   replace it.
 
