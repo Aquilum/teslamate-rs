@@ -382,6 +382,10 @@ impl HasAuthDb for App {
     fn auth_db(&self) -> &Db {
         &self.db
     }
+
+    fn password_backend(&self) -> PasswordBackend {
+        self.password_backend
+    }
 }
 
 #[cfg(test)]

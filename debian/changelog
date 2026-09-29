@@ -2,6 +2,8 @@ teslamate-rs (0.2.0-1) UNRELEASED; urgency=medium
 
   * Add grouped locations and asynchronous historical geofence matching.
   * Improve grouped live vehicle fallbacks and location map reliability.
+  * Recheck PAM group access for sessions and passkeys; limit geofence edits to admins.
+  * Authenticate through unix_chkpwd without adding the web service to shadow.
 
  -- Tom Dewey <tom@fleetcom.org>  Fri, 25 Sep 2026 22:30:00 +0100
 

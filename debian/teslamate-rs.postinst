@@ -15,8 +15,10 @@ if [ "$1" = configure ]; then
 		adduser --system --ingroup teslamate-rs --home /srv/teslamate-rs --no-create-home \
 			--gecos "teslamate-rs TeslaMate service" teslamate-rs
 	fi
-	if getent group shadow >/dev/null; then
-		adduser teslamate-rs shadow >/dev/null 2>&1 || true
+	# Older packages added the entire web daemon to shadow. pam_unix can use
+	# the system's setgid unix_chkpwd helper instead.
+	if getent group shadow >/dev/null && id -nG teslamate-rs | grep -qw shadow; then
+		deluser teslamate-rs shadow
 	fi
 	if [ -d /srv/teslamate-rs ]; then
 		chown teslamate-rs:teslamate-rs /srv/teslamate-rs

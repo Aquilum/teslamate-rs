@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=simple
 User=teslamate-rs
 Group=teslamate-rs
-SupplementaryGroups=shadow
 WorkingDirectory=/srv/teslamate-rs
 Environment=TESLAMATE_RS_HOME=/srv/teslamate-rs
 Environment=TESLAMATE_RS_BIND=127.0.0.1
@@ -24,7 +23,9 @@ SyslogIdentifier=teslamate-rs
 AmbientCapabilities=
 CapabilityBoundingSet=
 LockPersonality=yes
-NoNewPrivileges=yes
+# pam_unix uses the system's setgid unix_chkpwd helper for unprivileged callers.
+# The daemon itself must not belong to the shadow group.
+NoNewPrivileges=no
 PrivateDevices=yes
 PrivateTmp=yes
 ProtectClock=yes
@@ -40,7 +41,7 @@ ReadWritePaths=/srv/teslamate-rs
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+RestrictSUIDSGID=no
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 UMask=0077
