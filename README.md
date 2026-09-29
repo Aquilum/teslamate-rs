@@ -33,6 +33,7 @@ sudo systemctl enable --now teslamate-rs
 - First successful PAM login becomes **admin**. Later Linux users must be in group `teslamate-rs`.
 - Passkeys still work after that account exists. Invites are disabled under PAM; Unix group membership is the invite.
 - Removing a user from the required PAM group blocks passkey sign-in and revokes each active session on its next request.
+- The Debian service delegates each PAM password check to a short-lived socket-activated helper with `shadow` group access; the web process itself cannot read `/etc/shadow`.
 - `root` cannot sign in unless `TESLAMATE_RS_PAM_ALLOW_ROOT=1`.
 - `TESLAMATE_RS_AUTH=local` or `--auth local` restores the SQLite password database.
 
