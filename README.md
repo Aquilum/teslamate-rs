@@ -32,6 +32,7 @@ sudo systemctl enable --now teslamate-rs
 
 - First successful PAM login becomes **admin**. Later Linux users must be in group `teslamate-rs`.
 - Passkeys still work after that account exists. Invites are disabled under PAM; Unix group membership is the invite.
+- Removing a user from the required PAM group blocks passkey sign-in and revokes each active session on its next request.
 - `root` cannot sign in unless `TESLAMATE_RS_PAM_ALLOW_ROOT=1`.
 - `TESLAMATE_RS_AUTH=local` or `--auth local` restores the SQLite password database.
 
@@ -50,8 +51,19 @@ Car telemetry stays in the shared SQLite file. Profiles only control who can ope
 
 Each account picks an interface, stored on that profile: **Classic dashboards** (the Grafana pages) or **Grouped** (Vehicle, Battery, Trips, Software). Grouped keeps each history on one page and adds the live vehicle card TeslaMate showed outside Grafana — where the car is, locks, sentry, closures, tires, and climate — from the last Owner API poll. A drive or a charge opens in place from its row: the route or the charger, the battery, and one line of how it went.
 
+Grouped locations are visible to all signed-in users. Only admins can create, edit, delete, or rematch them, since locations control shared charging costs.
+
 ## Build
 
 ```
 cargo build --release --manifest-path /home/tdewey/src/teslamate-rs/Cargo.toml
+```
+
+Browser regression test (Chrome/Chromium or Firefox with WebDriver):
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r tests/requirements-selenium.txt
+cargo build --locked --bin teslamate-rs
+.venv/bin/python -m unittest discover -s tests -p test_grouped_locations.py
 ```

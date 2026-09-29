@@ -8,6 +8,7 @@ let cars = [];
 let dashGen = 0;
 let dashAbort = null;
 let uiLayout = "classic";
+let canEditLocations = false;
 let currentMeta = "vehicle";
 let liveTimer = null;
 const dashCache = new Map();
@@ -2503,11 +2504,11 @@ async function loadGrouped(id) {
 
 async function loadLocationsPage(board, signal) {
   board.innerHTML = `<section class="locations-page">
-    <p class="locations-intro">Add places such as Home and Work. Saved areas are shared across accounts and match past and future charging sessions and trip endpoints.</p>
-    <div class="locations-status"><span id="locations-summary"></span><button type="button" class="ghost" id="locations-rematch">Rematch history</button></div>
-    <div class="locations-editor">
-      <div><div class="location-map" id="location-map"></div><p class="locations-hint">Click the map to set the centre. Adjust the radius to cover the parking area.</p></div>
-      <form id="location-form" class="location-form">
+    <p class="locations-intro">Saved areas such as Home and Work are shared across accounts and match charging sessions and trip endpoints.</p>
+    <div class="locations-status"><span id="locations-summary"></span><button type="button" class="ghost" id="locations-rematch" ${canEditLocations ? "" : "hidden"}>Rematch history</button></div>
+    <div class="locations-editor${canEditLocations ? "" : " view-only"}">
+      <div><div class="location-map" id="location-map"></div>${canEditLocations ? '<p class="locations-hint">Click the map to set the centre. Adjust the radius to cover the parking area.</p>' : ""}</div>
+      <form id="location-form" class="location-form" ${canEditLocations ? "" : "hidden"}>
         <h2 id="location-form-title">New location</h2>
         <label>Name<input name="name" maxlength="80" required placeholder="Home, Work, Supercharger"></label>
         <div class="location-shortcuts"><button type="button" class="ghost" data-name="Home">Home</button><button type="button" class="ghost" data-name="Work">Work</button></div>
@@ -2550,6 +2551,7 @@ async function loadLocationsPage(board, signal) {
     });
     const showError = (message = "") => { error.textContent = message; error.hidden = !message; };
     const drawPreview = (center = false) => {
+      if (!canEditLocations) return;
       const p = fields();
       if (!Number.isFinite(p.latitude) || !Number.isFinite(p.longitude)) return;
       if (preview) preview.remove();
@@ -2573,10 +2575,10 @@ async function loadLocationsPage(board, signal) {
     };
     for (const loc of locations) {
       L.circle([loc.latitude, loc.longitude], { radius: loc.radius, color: "#6ED0E0", fillOpacity: 0.1 })
-        .bindTooltip(escapeHtml(loc.name)).on("click", () => edit(loc)).addTo(savedLayers);
+        .bindTooltip(escapeHtml(loc.name)).on("click", () => { if (canEditLocations) edit(loc); }).addTo(savedLayers);
     }
     if (locations.length) map.fitBounds(savedLayers.getBounds().pad(0.2), { maxZoom: 14 });
-    rows.innerHTML = locations.length ? `<div class="location-table">${locations.map((loc) => `<article class="location-row"><div><strong>${escapeHtml(loc.name)}</strong><small>${Number(loc.latitude).toFixed(5)}, ${Number(loc.longitude).toFixed(5)} · ${loc.radius} m · ${loc.charges} charges · ${loc.driveEnds} trip ends</small><small>${loc.costPerUnit == null && loc.sessionFee == null ? "No charging rate" : `${loc.costPerUnit == null ? "" : `${fmtCost(loc.costPerUnit)} / ${loc.billingType === "per_minute" ? "min" : "kWh"}`}${loc.sessionFee == null ? "" : ` · ${fmtCost(loc.sessionFee)} session fee`}`}</small></div><div class="location-row-actions"><button type="button" class="ghost" data-edit="${loc.id}">Edit</button><button type="button" class="ghost danger" data-delete="${loc.id}">Delete</button></div></article>`).join("")}</div>` : `<p class="locations-empty">No locations yet. Click the map to place your first geofence.</p>`;
+    rows.innerHTML = locations.length ? `<div class="location-table">${locations.map((loc) => `<article class="location-row"><div><strong>${escapeHtml(loc.name)}</strong><small>${Number(loc.latitude).toFixed(5)}, ${Number(loc.longitude).toFixed(5)} · ${loc.radius} m · ${loc.charges} charges · ${loc.driveEnds} trip ends</small><small>${loc.costPerUnit == null && loc.sessionFee == null ? "No charging rate" : `${loc.costPerUnit == null ? "" : `${fmtCost(loc.costPerUnit)} / ${loc.billingType === "per_minute" ? "min" : "kWh"}`}${loc.sessionFee == null ? "" : ` · ${fmtCost(loc.sessionFee)} session fee`}`}</small></div>${canEditLocations ? `<div class="location-row-actions"><button type="button" class="ghost" data-edit="${loc.id}">Edit</button><button type="button" class="ghost danger" data-delete="${loc.id}">Delete</button></div>` : ""}</article>`).join("")}</div>` : `<p class="locations-empty">${canEditLocations ? "No locations yet. Click the map to place your first geofence." : "No locations have been saved yet."}</p>`;
     const pollJob = async () => {
       if (signal.aborted || !board.isConnected) return;
       try {
@@ -2605,6 +2607,7 @@ async function loadLocationsPage(board, signal) {
     };
     pollJob();
     board.querySelector("#locations-rematch").addEventListener("click", async () => {
+      if (!canEditLocations) return;
       if (!locations.length || !confirm("Match past charging sessions and trip ends to the nearest saved location? Non-invoice charge costs will be recalculated.")) return;
       try {
         const response = await api("/api/geofences/rematch", { method: "POST" });
@@ -2616,6 +2619,7 @@ async function loadLocationsPage(board, signal) {
     form.elements.longitude.addEventListener("input", () => drawPreview());
     form.elements.radius.addEventListener("input", () => drawPreview());
     map.on("click", (event) => {
+      if (!canEditLocations) return;
       form.elements.latitude.value = event.latlng.lat.toFixed(6);
       form.elements.longitude.value = event.latlng.lng.toFixed(6);
       drawPreview();
@@ -2690,6 +2694,7 @@ async function chooseLayout(next) {
 async function boot() {
   const st = await tmAuth.status();
   if (!(await tmAuth.route(st))) return;
+  canEditLocations = !!st.user?.isAdmin;
   uiLayout = st.uiLayout === "grouped" ? "grouped" : "classic";
   const layoutSel = $("ui-layout");
   if (layoutSel) layoutSel.value = uiLayout;

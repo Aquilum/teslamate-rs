@@ -188,6 +188,14 @@ mod linux {
         unsafe { !libc::getgrnam(c.as_ptr()).is_null() }
     }
 
+    pub fn user_exists(username: &str) -> bool {
+        let Ok(c) = CString::new(username) else {
+            return false;
+        };
+        let _lock = NSS.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { !libc::getpwnam(c.as_ptr()).is_null() }
+    }
+
     pub fn user_in_group(username: &str, group: &str) -> Result<bool, String> {
         let user_c = CString::new(username).map_err(|_| "invalid username")?;
         let group_c = CString::new(group).map_err(|_| "invalid group")?;
@@ -222,7 +230,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{authenticate, group_exists, user_in_group};
+pub use linux::{authenticate, group_exists, user_exists, user_in_group};
 
 #[cfg(not(target_os = "linux"))]
 pub fn authenticate(_username: &str, _password: &str) -> Result<(), String> {
@@ -231,6 +239,11 @@ pub fn authenticate(_username: &str, _password: &str) -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn group_exists(_group: &str) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn user_exists(_username: &str) -> bool {
     false
 }
 
