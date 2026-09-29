@@ -46,6 +46,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// One PAM check on a systemd accepted socket (internal helper).
+    #[command(hide = true)]
+    PamCheck,
     /// Import a live TeslaMate Postgres instance via docker exec
     Import {
         #[arg(long, default_value = "teslamate-database-1")]
@@ -156,10 +159,14 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if matches!(&cli.cmd, Cmd::PamCheck) {
+        return pam_auth::run_stdio_check().map_err(|e| anyhow::anyhow!(e.to_string()));
+    }
     let db_path = cli.db.unwrap_or_else(db::default_db_path);
     let db = db::open(&db_path)?;
 
     match cli.cmd {
+        Cmd::PamCheck => unreachable!("handled before opening the database"),
         Cmd::Import {
             docker,
             user,
