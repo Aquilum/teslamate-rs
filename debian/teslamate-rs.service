@@ -1,7 +1,8 @@
 [Unit]
 Description=teslamate-rs (TeslaMate dashboards + SQLite)
-After=network-online.target
+After=network-online.target teslamate-rs-pam.socket
 Wants=network-online.target
+Requires=teslamate-rs-pam.socket
 
 [Service]
 Type=simple
@@ -12,6 +13,7 @@ Environment=TESLAMATE_RS_HOME=/srv/teslamate-rs
 Environment=TESLAMATE_RS_BIND=127.0.0.1
 Environment=TESLAMATE_RS_PORT=4010
 Environment=TESLAMATE_RS_AUTH=pam
+Environment=TESLAMATE_RS_PAM_SOCK=/run/teslamate-rs/pam.sock
 EnvironmentFile=-/etc/default/teslamate-rs
 ExecStart=/usr/bin/teslamate-rs serve --bind 127.0.0.1 --port 4010 --auth pam
 Restart=on-failure
@@ -23,9 +25,7 @@ SyslogIdentifier=teslamate-rs
 AmbientCapabilities=
 CapabilityBoundingSet=
 LockPersonality=yes
-# pam_unix uses the system's setgid unix_chkpwd helper for unprivileged callers.
-# The daemon itself must not belong to the shadow group.
-NoNewPrivileges=no
+NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateTmp=yes
 ProtectClock=yes
@@ -41,7 +41,7 @@ ReadWritePaths=/srv/teslamate-rs
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=no
+RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 UMask=0077
@@ -49,3 +49,4 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
+Also=teslamate-rs-pam.socket

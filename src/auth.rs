@@ -343,13 +343,7 @@ pub fn pam_access_allowed(username: &str, backend: PasswordBackend) -> bool {
     if backend != PasswordBackend::Pam {
         return true;
     }
-    if username.eq_ignore_ascii_case("root") && !pam_auth::allow_root() {
-        return false;
-    }
-    match pam_auth::required_group() {
-        Some(group) => pam_auth::user_in_group(username, &group).unwrap_or(false),
-        None => pam_auth::user_exists(username),
-    }
+    pam_auth::access_allowed(username)
 }
 
 pub fn current_user(
