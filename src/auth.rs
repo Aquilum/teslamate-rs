@@ -29,6 +29,7 @@ pub const WA_COOKIE: &str = "teslamate_wa";
 
 pub trait HasAuthDb: Send + Sync {
     fn auth_db(&self) -> &Db;
+    fn password_backend(&self) -> PasswordBackend;
 }
 
 #[derive(Clone)]
@@ -338,12 +339,46 @@ fn session_token_from(jar: &CookieJar) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn current_user(jar: &CookieJar, db: &Db) -> Result<Option<AuthUser>, Box<dyn std::error::Error>> {
+pub fn pam_access_allowed(username: &str, backend: PasswordBackend) -> bool {
+    if backend != PasswordBackend::Pam {
+        return true;
+    }
+    if username.eq_ignore_ascii_case("root") && !pam_auth::allow_root() {
+        return false;
+    }
+    match pam_auth::required_group() {
+        Some(group) => pam_auth::user_in_group(username, &group).unwrap_or(false),
+        None => pam_auth::user_exists(username),
+    }
+}
+
+pub fn current_user(
+    jar: &CookieJar,
+    db: &Db,
+    backend: PasswordBackend,
+) -> Result<Option<AuthUser>, Box<dyn std::error::Error>> {
+    current_user_with_policy(jar, db, backend, pam_access_allowed)
+}
+
+fn current_user_with_policy(
+    jar: &CookieJar,
+    db: &Db,
+    backend: PasswordBackend,
+    allowed: impl Fn(&str, PasswordBackend) -> bool,
+) -> Result<Option<AuthUser>, Box<dyn std::error::Error>> {
     let Some(token) = session_token_from(jar) else {
         return Ok(None);
     };
-    let conn = db.lock();
-    Ok(users::user_from_session(&conn, &token)?.map(|u| AuthUser::from(&u)))
+    let user = {
+        let conn = db.lock();
+        users::user_from_session(&conn, &token)?
+    };
+    if user.as_ref().is_some_and(|u| !allowed(&u.username, backend)) {
+        let conn = db.lock();
+        users::delete_session(&conn, &token)?;
+        return Ok(None);
+    }
+    Ok(user.as_ref().map(AuthUser::from))
 }
 
 impl<S: HasAuthDb> FromRequestParts<S> for AuthUser {
@@ -353,7 +388,7 @@ impl<S: HasAuthDb> FromRequestParts<S> for AuthUser {
         let jar = CookieJar::from_request_parts(parts, state)
             .await
             .map_err(|_| api_err(StatusCode::UNAUTHORIZED, "sign in required"))?;
-        current_user(&jar, state.auth_db())
+        current_user(&jar, state.auth_db(), state.password_backend())
             .map_err(internal_err)?
             .ok_or_else(|| api_err(StatusCode::UNAUTHORIZED, "sign in required"))
     }
@@ -367,7 +402,7 @@ impl<S: HasAuthDb> FromRequestParts<S> for OptionalUser {
             .await
             .map_err(|_| api_err(StatusCode::UNAUTHORIZED, "sign in required"))?;
         Ok(OptionalUser(
-            current_user(&jar, state.auth_db()).map_err(internal_err)?,
+            current_user(&jar, state.auth_db(), state.password_backend()).map_err(internal_err)?,
         ))
     }
 }
@@ -513,6 +548,26 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn revoked_pam_access_invalidates_existing_session() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        let db = Db::from_write(conn);
+        let token = "session-test-token";
+        {
+            let conn = db.lock();
+            let user = users::insert_user(&conn, "former-member", None, false).unwrap();
+            users::create_session(&conn, user.id, token).unwrap();
+        }
+        let jar = CookieJar::new().add(Cookie::new(SESSION_COOKIE, token));
+        assert!(current_user_with_policy(&jar, &db, PasswordBackend::Pam, |_, _| false)
+            .unwrap()
+            .is_none());
+        assert!(current_user_with_policy(&jar, &db, PasswordBackend::Pam, |_, _| true)
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn password_hash_roundtrip() {

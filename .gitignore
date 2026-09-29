@@ -1,4 +1,6 @@
 /target
+/.venv/
+__pycache__/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
@@ -13,4 +15,3 @@
 /debian/*.debhelper.log
 /debian/.debhelper
 /debian/debhelper-build-stamp
-
