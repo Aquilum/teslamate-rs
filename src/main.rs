@@ -16,6 +16,7 @@ mod query_allowlist;
 mod refresh;
 mod seed;
 mod server;
+mod sleep;
 mod sql;
 mod tesla;
 mod token_crypto;
