@@ -1,13 +1,19 @@
 use crate::db::Db;
+use crate::sleep::{self, Action, Activity, Phase, ProbeOutcome, ProbePurpose, StreamReading};
 use crate::tesla::{self, Tesla, Tokens};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
+
+const STREAM_COLUMNS: &str =
+    "speed,odometer,soc,elevation,est_heading,est_lat,est_lng,power,shift_state,range,est_range,heading";
+const STREAM_IDLE: Duration = Duration::from_secs(90);
 
 /// Strip HTML/script-friendly punctuation from Tesla display names before storage.
 pub fn sanitize_vehicle_name(raw: &str) -> String {
@@ -31,11 +37,12 @@ pub fn poll_secs() -> u64 {
         .unwrap_or(30)
 }
 
-fn asleep_secs(suspend_min: i64) -> u64 {
-    if poll_secs() <= 5 {
-        poll_secs()
+fn fast_poll() -> Option<u64> {
+    let secs = poll_secs();
+    if secs <= 5 {
+        Some(secs.max(1))
     } else {
-        (suspend_min.max(1) as u64) * 60
+        None
     }
 }
 
@@ -136,101 +143,223 @@ async fn upsert_vehicles(db: &Db, mut tesla: Tesla) -> Result<()> {
     Ok(())
 }
 
+struct EnabledCar {
+    id: i64,
+    vid: i64,
+    eid: i64,
+    cfg: sleep::IdleConfig,
+}
+
+struct Tracked {
+    phase: Phase,
+    next_poll: Instant,
+}
+
 pub async fn run(db: Db) {
+    let mut tracked: HashMap<i64, Tracked> = HashMap::new();
     loop {
-        match load_tokens(&db) {
-            Ok(Some(tokens)) => {
-                if let Err(e) = run_once(db.clone(), tokens).await {
+        let delay = match load_tokens(&db) {
+            Ok(Some(tokens)) => match poll_due(&db, tokens, &mut tracked).await {
+                Ok(delay) => delay,
+                Err(e) => {
                     warn!("logger: {e:#}");
+                    Duration::from_secs(poll_secs().max(1))
                 }
-            }
+            },
             Ok(None) => {
+                tracked.clear();
                 tracing::debug!("logger idle (no oauth tokens; run teslamate-rs login)");
+                Duration::from_secs(poll_secs().max(1))
             }
-            Err(e) => warn!("logger tokens: {e:#}"),
-        }
-        tokio::time::sleep(Duration::from_secs(poll_secs())).await;
+            Err(e) => {
+                warn!("logger tokens: {e:#}");
+                Duration::from_secs(poll_secs().max(1))
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
-async fn run_once(db: Db, tokens: Tokens) -> Result<()> {
+async fn poll_due(
+    db: &Db,
+    tokens: Tokens,
+    tracked: &mut HashMap<i64, Tracked>,
+) -> Result<Duration> {
     let mut tesla = Tesla::new(tokens)?;
-    let cars: Vec<(i64, i64, i64, i64, i64)> = {
-        let conn = db.lock();
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.vid, c.eid, s.suspend_min, s.use_streaming_api
-             FROM cars c JOIN car_settings s ON s.id = c.settings_id
-             WHERE s.enabled = 1",
-        )?;
-        let cars = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        cars
-    };
-    for (car_id, vid, eid, suspend_min, use_stream) in cars {
-        if let Err(e) = poll_car(&db, &mut tesla, car_id, vid, eid, suspend_min, use_stream == 1)
-            .await
-        {
-            warn!("car {car_id}: {e:#}");
+    let cars = load_cars(db)?;
+    let ids: Vec<i64> = cars.iter().map(|c| c.id).collect();
+    tracked.retain(|id, _| ids.contains(id));
+    let now = Instant::now();
+    for car in cars {
+        let phase = {
+            let entry = tracked.entry(car.id).or_insert(Tracked {
+                phase: Phase::Startup,
+                next_poll: now,
+            });
+            if entry.next_poll > Instant::now() {
+                None
+            } else {
+                Some(entry.phase)
+            }
+        };
+        let Some(phase) = phase else {
+            continue;
+        };
+        match poll_car(db, &mut tesla, &car, phase).await {
+            Ok((phase, wait)) => {
+                if let Some(entry) = tracked.get_mut(&car.id) {
+                    entry.phase = phase;
+                    entry.next_poll = Instant::now() + wait;
+                }
+            }
+            Err(e) => {
+                warn!("car {}: {e:#}", car.id);
+                if let Some(entry) = tracked.get_mut(&car.id) {
+                    entry.next_poll = Instant::now() + Duration::from_secs(poll_secs().max(1));
+                }
+            }
         }
-        let _ = store_tokens(&db, tesla.tokens());
+        let _ = store_tokens(db, tesla.tokens());
     }
-    Ok(())
+    Ok(next_delay(tracked))
+}
+
+fn next_delay(tracked: &HashMap<i64, Tracked>) -> Duration {
+    let now = Instant::now();
+    let cap = Duration::from_secs(poll_secs().max(1));
+    let wait = tracked
+        .values()
+        .map(|t| t.next_poll)
+        .min()
+        .map(|t| t.saturating_duration_since(now))
+        .unwrap_or(cap);
+    wait.min(cap).max(Duration::from_millis(200))
+}
+
+fn load_cars(db: &Db) -> Result<Vec<EnabledCar>> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.vid, c.eid, s.suspend_min, s.suspend_after_idle_min,
+                s.use_streaming_api, s.req_not_unlocked
+         FROM cars c JOIN car_settings s ON s.id = c.settings_id
+         WHERE s.enabled = 1",
+    )?;
+    let active = poll_secs();
+    let fast = fast_poll().is_some();
+    let cars = stmt
+        .query_map([], |r| {
+            let use_streaming = r.get::<_, i64>(5)? == 1;
+            let req_not_unlocked = r.get::<_, i64>(6)? == 1;
+            Ok(EnabledCar {
+                id: r.get(0)?,
+                vid: r.get(1)?,
+                eid: r.get(2)?,
+                cfg: sleep::config_for(
+                    r.get(3)?,
+                    r.get(4)?,
+                    use_streaming,
+                    req_not_unlocked,
+                    active,
+                    fast,
+                ),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(cars)
 }
 
 async fn poll_car(
     db: &Db,
     tesla: &mut Tesla,
-    car_id: i64,
-    vid: i64,
-    eid: i64,
-    suspend_min: i64,
-    use_stream: bool,
-) -> Result<()> {
-    let summary = tesla.vehicle(vid).await?;
+    car: &EnabledCar,
+    phase: Phase,
+) -> Result<(Phase, Duration)> {
+    let summary = tesla.vehicle(car.vid).await?;
     let state = tesla::str_field(&summary, &["state"]).unwrap_or("unknown");
-    record_state(db, car_id, state)?;
-    match state {
-        "asleep" | "offline" => {
-            {
-                let conn = db.lock();
-                crate::live::record_snapshot(&conn, car_id, state, None)?;
+    record_state(db, car.id, state)?;
+    let now = Instant::now();
+    match sleep::plan(&phase, state, now, &car.cfg) {
+        Action::SummaryOnly { phase: next, wait } => {
+            record_summary(db, car.id, state);
+            if matches!(next, Phase::Asleep) && !matches!(phase, Phase::Asleep) {
+                info!("car {}: {state}; not requesting vehicle_data", car.id);
             }
-            tokio::time::sleep(Duration::from_secs(asleep_secs(suspend_min))).await;
+            Ok((next, wait))
         }
-        "online" => {
-            let data = tesla.vehicle_data(vid).await?;
-            {
-                let conn = db.lock();
-                crate::live::record_snapshot(&conn, car_id, state, Some(&data))?;
-            }
-            persist_snapshot(db, car_id, &data)?;
-            if is_charging(&data) {
-                persist_charge_tick(db, car_id, &data)?;
-            } else if is_driving(&data) {
-                persist_drive_tick(db, car_id, &data)?;
-                if use_stream {
-                    let _ = stream_drive(db, tesla, car_id, eid).await;
+        Action::Probe { purpose } => {
+            let reading = probe_stream(tesla, car.eid, purpose).await;
+            match sleep::after_probe(purpose, &reading, &phase, Instant::now(), &car.cfg) {
+                ProbeOutcome::VehicleData => fetch_vehicle_data(db, tesla, car, phase).await,
+                ProbeOutcome::Wait { phase: next, wait } => {
+                    record_summary(db, car.id, state);
+                    if purpose == ProbePurpose::Wake && matches!(next, Phase::Asleep) {
+                        tracing::debug!(
+                            "car {}: online looks like a subsystem check; not calling vehicle_data",
+                            car.id
+                        );
+                    }
+                    Ok((next, wait))
                 }
             }
         }
-        _ => {}
+        Action::VehicleData => fetch_vehicle_data(db, tesla, car, phase).await,
     }
-    Ok(())
 }
 
-fn is_charging(data: &Value) -> bool {
-    matches!(
-        tesla::str_field(data, &["charge_state", "charging_state"]),
-        Some("Charging" | "Starting" | "Complete")
-    ) && tesla::str_field(data, &["charge_state", "charging_state"]) != Some("Complete")
+fn record_summary(db: &Db, car_id: i64, state: &str) {
+    let conn = db.lock();
+    if let Err(e) = crate::live::record_snapshot(&conn, car_id, state, None) {
+        warn!("car {car_id}: snapshot: {e:#}");
+    }
 }
 
-fn is_driving(data: &Value) -> bool {
-    match tesla::str_field(data, &["drive_state", "shift_state"]) {
-        Some("D" | "R" | "N") => true,
-        _ => tesla::f64_field(data, &["drive_state", "speed"]).unwrap_or(0.0) > 0.0,
+async fn fetch_vehicle_data(
+    db: &Db,
+    tesla: &mut Tesla,
+    car: &EnabledCar,
+    phase: Phase,
+) -> Result<(Phase, Duration)> {
+    let data = tesla.vehicle_data(car.vid).await?;
+    {
+        let conn = db.lock();
+        crate::live::record_snapshot(&conn, car.id, "online", Some(&data))?;
     }
+    let applied = sleep::apply_vehicle_data(&data, &phase, Instant::now(), &car.cfg);
+    match applied.activity {
+        Activity::Charging => persist_charge_tick(db, car.id, &data)?,
+        Activity::Driving => persist_drive_tick(db, car.id, &data)?,
+        Activity::Idle => {
+            persist_snapshot(db, car.id, &data)?;
+        }
+    }
+    let mut phase_out = applied.phase;
+    if applied.activity == Activity::Driving && car.cfg.use_streaming {
+        if matches!(
+            stream_drive(db, tesla, car.id, car.eid).await,
+            StreamEnd::Idle
+        ) {
+            phase_out = Phase::Awake {
+                idle_since: Instant::now()
+                    .checked_sub(STREAM_IDLE)
+                    .unwrap_or_else(Instant::now),
+            };
+        }
+    }
+    if matches!(phase, Phase::Asleep | Phase::Suspended { .. })
+        && !matches!(phase_out, Phase::Suspended { .. })
+    {
+        info!("car {}: resuming vehicle_data", car.id);
+    }
+    if let Some(block) = applied.block {
+        info!(
+            "car {}: not suspending ({block}); vehicle_data keeps the car awake",
+            car.id
+        );
+    }
+    if matches!(phase_out, Phase::Suspended { .. }) && !matches!(phase, Phase::Suspended { .. }) {
+        info!("car {}: suspending logging so the car can sleep", car.id);
+    }
+    Ok((phase_out, applied.wait))
 }
 
 fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
@@ -284,13 +413,13 @@ fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
 
 /// One online poll: GPS snapshot plus drive/charge tick if that is what the car is doing.
 pub fn ingest_online(db: &Db, car_id: i64, data: &Value) -> Result<()> {
-    if is_charging(data) {
-        persist_charge_tick(db, car_id, data)
-    } else if is_driving(data) {
-        persist_drive_tick(db, car_id, data)
-    } else {
-        persist_snapshot(db, car_id, data)?;
-        Ok(())
+    match sleep::activity(data) {
+        Activity::Charging => persist_charge_tick(db, car_id, data),
+        Activity::Driving => persist_drive_tick(db, car_id, data),
+        Activity::Idle => {
+            persist_snapshot(db, car_id, data)?;
+            Ok(())
+        }
     }
 }
 
@@ -353,7 +482,8 @@ fn persist_charge_tick(db: &Db, car_id: i64, data: &Value) -> Result<()> {
                 car_id,
                 pos_id,
                 tesla::i64_field(data, &["charge_state", "battery_level"]),
-                tesla::f64_field(data, &["charge_state", "ideal_battery_range"]).map(|m| m * 1.60934),
+                tesla::f64_field(data, &["charge_state", "ideal_battery_range"])
+                    .map(|m| m * 1.60934),
                 tesla::f64_field(data, &["charge_state", "battery_range"]).map(|m| m * 1.60934),
             ],
         )?;
@@ -419,7 +549,10 @@ fn record_state(db: &Db, car_id: i64, state: &str) -> Result<()> {
     match current {
         Some((_, ref s)) if s == state => {}
         Some((id, _)) => {
-            conn.execute("UPDATE states SET end_date=?1 WHERE id=?2", params![now, id])?;
+            conn.execute(
+                "UPDATE states SET end_date=?1 WHERE id=?2",
+                params![now, id],
+            )?;
             conn.execute(
                 "INSERT INTO states (state, start_date, car_id) VALUES (?1,?2,?3)",
                 params![state, now, car_id],
@@ -435,38 +568,116 @@ fn record_state(db: &Db, car_id: i64, state: &str) -> Result<()> {
     Ok(())
 }
 
-async fn stream_drive(db: &Db, tesla: &Tesla, car_id: i64, eid: i64) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(Tesla::stream_url()).await?;
-    let sub = json!({
+enum StreamEnd {
+    /// No stream message for `STREAM_IDLE`. The car has likely been parked that long.
+    Idle,
+    Stopped,
+}
+
+fn stream_subscribe(tesla: &Tesla, eid: i64) -> Value {
+    json!({
         "msg_type": "data:subscribe_oauth",
         "token": tesla.tokens().access_token,
-        "value": "speed,odometer,soc,elevation,est_heading,est_lat,est_lng,power,shift_state,range,est_range,heading",
+        "value": STREAM_COLUMNS,
         "tag": eid.to_string(),
-    });
-    ws.send(Message::Text(sub.to_string().into())).await?;
-    let idle = Duration::from_secs(90);
+    })
+}
+
+async fn probe_stream(tesla: &Tesla, eid: i64, purpose: ProbePurpose) -> StreamReading {
+    let timeout = sleep::probe_timeout(purpose, fast_poll());
+    match tokio::time::timeout(timeout, read_stream_sample(tesla, eid)).await {
+        Ok(reading) => reading,
+        Err(_) => StreamReading::Timeout,
+    }
+}
+
+async fn read_stream_sample(tesla: &Tesla, eid: i64) -> StreamReading {
+    let (mut ws, _) = match tokio_tungstenite::connect_async(Tesla::stream_url()).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::debug!("stream connect: {e}");
+            return StreamReading::Error;
+        }
+    };
+    if let Err(e) = ws
+        .send(Message::Text(
+            stream_subscribe(tesla, eid).to_string().into(),
+        ))
+        .await
+    {
+        tracing::debug!("stream subscribe: {e}");
+        return StreamReading::Error;
+    }
     loop {
-        match tokio::time::timeout(idle, ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => {
                 let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
-                if v.get("msg_type").and_then(|m| m.as_str()) == Some("data:error") {
-                    warn!("stream error: {t}");
-                    break;
-                }
-                if let Some(value) = v.get("value").and_then(|x| x.as_str()) {
-                    ingest_stream_row(db, car_id, value)?;
+                match v.get("msg_type").and_then(|m| m.as_str()) {
+                    Some("data:error") => {
+                        tracing::debug!("stream error");
+                        return StreamReading::Error;
+                    }
+                    Some("data:update") => {
+                        if let Some(csv) = v.get("value").and_then(|x| x.as_str()) {
+                            if let Some(sample) = sleep::parse_stream_csv(csv) {
+                                return StreamReading::Sample(sample);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
-            Ok(Some(Err(e))) => {
-                warn!("stream: {e}");
-                break;
+            Some(Ok(Message::Close(_))) | None => return StreamReading::Error,
+            Some(Err(e)) => {
+                tracing::debug!("stream: {e}");
+                return StreamReading::Error;
             }
-            Err(_) => break,
             _ => {}
         }
     }
-    Ok(())
+}
+
+async fn stream_drive(db: &Db, tesla: &Tesla, car_id: i64, eid: i64) -> StreamEnd {
+    let (mut ws, _) = match tokio_tungstenite::connect_async(Tesla::stream_url()).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("stream connect: {e}");
+            return StreamEnd::Stopped;
+        }
+    };
+    if let Err(e) = ws
+        .send(Message::Text(
+            stream_subscribe(tesla, eid).to_string().into(),
+        ))
+        .await
+    {
+        warn!("stream subscribe: {e}");
+        return StreamEnd::Stopped;
+    }
+    loop {
+        match tokio::time::timeout(STREAM_IDLE, ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                if v.get("msg_type").and_then(|m| m.as_str()) == Some("data:error") {
+                    warn!("stream error");
+                    return StreamEnd::Stopped;
+                }
+                if let Some(value) = v.get("value").and_then(|x| x.as_str()) {
+                    if let Err(e) = ingest_stream_row(db, car_id, value) {
+                        warn!("stream row: {e:#}");
+                        return StreamEnd::Stopped;
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return StreamEnd::Stopped,
+            Ok(Some(Err(e))) => {
+                warn!("stream: {e}");
+                return StreamEnd::Stopped;
+            }
+            Err(_) => return StreamEnd::Idle,
+            _ => {}
+        }
+    }
 }
 
 fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
