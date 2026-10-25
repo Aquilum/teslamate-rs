@@ -12,7 +12,12 @@ let canEditLocations = false;
 let currentMeta = "vehicle";
 let liveTimer = null;
 const dashCache = new Map();
-const META_IDS = new Set(["vehicle", "battery", "trips", "software", "locations"]);
+const META_IDS = new Set(["vehicle", "battery", "charges", "trips", "software", "locations"]);
+const DEBUG_ID = "debug";
+
+function isGroupedRoute(id) {
+  return META_IDS.has(id) || id === DEBUG_ID;
+}
 const QUERY_CLIENT_CONCURRENCY = 3;
 let queryActive = 0;
 const queryQueue = [];
@@ -231,6 +236,7 @@ function renderNav() {
     const pages = [
       ["vehicle", "Vehicle"],
       ["battery", "Battery"],
+      ["charges", "Charges"],
       ["trips", "Trips"],
       ["software", "Software"],
     ];
@@ -243,6 +249,7 @@ function renderNav() {
         )
         .join("") +
       `<h2>Places</h2><a href="#locations" data-path="locations" class="${currentMeta === "locations" ? "active" : ""}">Locations</a>`;
+    syncDebugLink();
     return;
   }
   const folders = {};
@@ -261,6 +268,13 @@ function renderNav() {
           .join("")
     )
     .join("");
+  syncDebugLink();
+}
+
+function syncDebugLink() {
+  const link = $("debug-link");
+  if (!link) return;
+  link.hidden = uiLayout !== "grouped";
 }
 
 async function loadDashboard(path) {
@@ -1823,7 +1837,7 @@ const META = [
   {
     id: "battery",
     title: "Battery",
-    lead: "Level, health, and every charge. Open a row to see the place and how the power came in.",
+    lead: "Level, health, and range. Charging sessions and their cost are on Charges.",
     sections: [
       { title: "Level", panels: [["charge-level.json", 2]] },
       {
@@ -1837,35 +1851,6 @@ const META = [
           ["battery-health.json", 28],
         ],
       },
-      {
-        title: "Charging",
-        panels: [
-          ["charging-stats.json", 8],
-          ["charging-stats.json", 10],
-          ["charging-stats.json", 14],
-          ["charging-stats.json", 27],
-          ["charging-stats.json", 26],
-          ["charging-stats.json", 31],
-          ["charging-stats.json", 32],
-          ["charging-stats.json", 33],
-          ["charging-stats.json", 15],
-          ["charging-stats.json", 16],
-          ["charging-stats.json", 18],
-          ["charging-stats.json", 24],
-          ["charging-stats.json", 20],
-          ["charging-stats.json", 29],
-          ["charging-stats.json", 2],
-          ["charging-stats.json", 13],
-          ["charging-stats.json", 4],
-          ["charging-stats.json", 6],
-          ["charges.json", 10],
-          ["charges.json", 20],
-          ["charges.json", 14],
-          ["charges.json", 15],
-          ["charges.json", 6],
-          ["charges.json", 17],
-        ],
-      },
       { title: "While parked", panels: [["vampire-drain.json", 2]] },
       {
         title: "Projected range",
@@ -1873,6 +1858,52 @@ const META = [
           ["projected-range.json", 2],
           ["projected-range.json", 6],
           ["projected-range.json", 5],
+        ],
+      },
+    ],
+  },
+  {
+    id: "charges",
+    title: "Charges",
+    lead: "What charging cost, how much energy came in, and each session. Open a row to see the charger and how the power arrived.",
+    sections: [
+      {
+        title: "Cost",
+        panels: [
+          ["charging-stats.json", 27],
+          ["charging-stats.json", 14],
+          ["charging-stats.json", 26],
+          ["charging-stats.json", 31],
+          ["charging-stats.json", 32],
+          ["charging-stats.json", 33],
+          ["charging-stats.json", 6],
+        ],
+      },
+      {
+        title: "Energy",
+        panels: [
+          ["charging-stats.json", 8],
+          ["charging-stats.json", 10],
+          ["charging-stats.json", 18],
+          ["charging-stats.json", 20],
+          ["charging-stats.json", 15],
+          ["charging-stats.json", 16],
+          ["charging-stats.json", 24],
+          ["charging-stats.json", 29],
+          ["charging-stats.json", 2],
+          ["charging-stats.json", 13],
+          ["charging-stats.json", 4],
+        ],
+      },
+      {
+        title: "Sessions",
+        panels: [
+          ["charges.json", 10],
+          ["charges.json", 20],
+          ["charges.json", 14],
+          ["charges.json", 15],
+          ["charges.json", 6],
+          ["charges.json", 17],
         ],
       },
     ],
@@ -1969,30 +2000,47 @@ const META = [
   {
     id: "software",
     title: "Software",
-    lead: "Firmware on the car, then this installation. The version you are running is the update history, not a second copy of the overview tile.",
+    lead: "Firmware installed on the car, and how often it has been updated.",
     sections: [
       {
         title: "Car",
         panels: [
+          ["database-info.json", 39],
           ["updates.json", 8],
           ["updates.json", 6],
           ["updates.json", 2],
         ],
       },
+    ],
+  },
+  {
+    id: DEBUG_ID,
+    title: "Debug",
+    lead: "This installation: database size, query timing, and record counts. Not part of the default grouped navigation.",
+    sections: [
       {
-        title: "This installation",
+        title: "Records",
         panels: [
           ["database-info.json", 32],
           ["database-info.json", 36],
-          ["database-info.json", 39],
           ["database-info.json", 42],
+        ],
+      },
+      {
+        title: "Database",
+        panels: [
           ["database-info.json", 51],
-          ["database-info.json", 33],
-          ["database-info.json", 38],
-          ["database-info.json", 41],
           ["database-info.json", 35],
           ["database-info.json", 52],
           ["database-info.json", 50],
+          ["database-info.json", 33],
+          ["database-info.json", 38],
+          ["database-info.json", 41],
+        ],
+      },
+      {
+        title: "Queries",
+        panels: [
           ["database-info.json", 48],
           ["database-info.json", 49],
           ["database-info.json", 47],
@@ -2669,11 +2717,11 @@ async function loadLocationsPage(board, signal) {
 function syncHashToLayout() {
   const hash = location.hash.replace(/^#/, "");
   if (uiLayout === "grouped") {
-    currentMeta = META_IDS.has(hash) ? hash : "vehicle";
+    currentMeta = isGroupedRoute(hash) ? hash : "vehicle";
     if (hash !== currentMeta) history.replaceState(null, "", "#" + currentMeta);
   } else if (hash.endsWith(".json")) {
     currentPath = hash;
-  } else if (META_IDS.has(hash)) {
+  } else if (isGroupedRoute(hash)) {
     history.replaceState(null, "", "#" + (currentPath || "overview.json"));
   }
 }
@@ -2747,7 +2795,7 @@ async function boot() {
   window.addEventListener("hashchange", () => {
     const hash = location.hash.replace(/^#/, "");
     if (uiLayout === "grouped") {
-      if (!META_IDS.has(hash)) {
+      if (!isGroupedRoute(hash)) {
         location.hash = currentMeta || "vehicle";
         return;
       }
@@ -2755,7 +2803,7 @@ async function boot() {
       loadGrouped(currentMeta);
       return;
     }
-    if (META_IDS.has(hash)) {
+    if (isGroupedRoute(hash)) {
       location.hash = currentPath || "overview.json";
       return;
     }
@@ -2767,6 +2815,11 @@ async function boot() {
     if (!a) return;
     e.preventDefault();
     location.hash = a.dataset.path;
+  });
+  $("debug-link")?.addEventListener("click", () => {
+    $("account")?.classList.remove("open");
+    if (location.hash.replace(/^#/, "") === DEBUG_ID) return;
+    location.hash = DEBUG_ID;
   });
   await reloadView();
 }
