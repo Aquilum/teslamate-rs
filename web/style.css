@@ -37,6 +37,7 @@ button.ghost { background: transparent; }
 .account .menu p { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
 .layout-pick { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; margin: 0 0 10px; }
 .layout-pick select { text-transform: none; letter-spacing: 0; font-size: 13px; width: 100%; }
+#debug-link { width: 100%; margin: 0 0 10px; text-align: left; }
 .account .menu .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 6px 0; border-top: 1px solid var(--border); }
 #nav { width: var(--nav); flex: none; background: #0c0d11; border-right: 1px solid var(--border); overflow: auto; padding: 16px 0 32px; }
 .brand { font-weight: 700; letter-spacing: 0.04em; padding: 0 16px 16px; color: var(--accent); }
