@@ -7,11 +7,16 @@
 //!
 //! TeslaMate (`TeslaMate.Vehicles.Vehicle`) therefore suspends logging once
 //! the car has been idle. With the streaming API that is 3 minutes of idle,
-//! then no `vehicle_data` until the stream shows real use or a confirmed
-//! wakeup. Without it, the idle and suspend intervals come from `car_settings`
+//! then no `vehicle_data` until the stream shows real use, the stream fails,
+//! or the car is still online after the suspend interval. A quiet parked
+//! sample must not cancel that deadline: the legacy stream often answers
+//! once with a parked row and then never reports the next drive. With
+//! streaming off, the idle and suspend intervals come from `car_settings`
 //! (`suspend_after_idle_min`, default 15; `suspend_min`, default 21). A brief
 //! online with streaming `power` nil is a subsystem check, not a wakeup —
 //! calling `vehicle_data` there turns a 2–3 minute blip into a full wake.
+//! If that nil reading continues well past the check, the car is actually
+//! awake and one `vehicle_data` is due.
 
 use crate::tesla;
 use serde_json::Value;
@@ -25,9 +30,13 @@ pub struct IdleConfig {
     pub asleep_interval: Duration,
     /// How long the car must sit idle before logging is suspended.
     pub idle_before_suspend: Duration,
-    /// Polling mode: `vehicle_data` again if the car is still online this long
-    /// after suspend. Streaming mode leaves this unused until the stream fails.
+    /// `vehicle_data` again if the summary still says online this long after
+    /// suspend. A later quiet stream sample keeps this deadline; it does not
+    /// push it back or cancel it.
     pub suspend_for: Duration,
+    /// Online with only nil stream power is treated as a subsystem check
+    /// until this passes.
+    pub subsystem_grace: Duration,
     /// `vehicle_data` cadence while idle but not yet suspended.
     pub idle_poll: Duration,
     pub user_present_poll: Duration,
@@ -72,6 +81,7 @@ pub fn config_for(
         keeper_poll: scale(30 * multiplier),
         blocked_poll: scale(15 * multiplier),
         active_poll: Duration::from_secs(active),
+        subsystem_grace: scale(5 * 60),
     }
 }
 
@@ -91,11 +101,15 @@ pub enum Phase {
     Startup,
     /// Last summary was asleep or offline. `vehicle_data` would wake it.
     Asleep,
+    /// Summary says online, but the stream has only sent nil power. A short
+    /// stretch of that is a subsystem check.
+    Checking { since: Instant },
     /// Logging. `idle_since` is the last time the car was busy, or when this
     /// idle stretch started.
     Awake { idle_since: Instant },
-    /// `vehicle_data` suppressed. `resume_at` is set in polling mode, and in
-    /// streaming mode only after the stream stops producing samples.
+    /// `vehicle_data` suppressed. `resume_at` is when to look again if the
+    /// car is still online. Streaming mode sets it on the first quiet or
+    /// failed probe and does not move it while later probes stay quiet.
     Suspended {
         idle_since: Instant,
         resume_at: Option<Instant>,
@@ -215,6 +229,11 @@ pub fn plan(phase: &Phase, summary_state: &str, now: Instant, cfg: &IdleConfig) 
         Phase::Suspended {
             resume_at: Some(t), ..
         } if now >= t => Action::VehicleData,
+        Phase::Checking { since }
+            if now.saturating_duration_since(since) >= cfg.subsystem_grace =>
+        {
+            Action::VehicleData
+        }
         Phase::Suspended { .. } if cfg.use_streaming => Action::Probe {
             purpose: ProbePurpose::Suspend,
         },
@@ -222,10 +241,14 @@ pub fn plan(phase: &Phase, summary_state: &str, now: Instant, cfg: &IdleConfig) 
             phase: *phase,
             wait: cfg.asleep_interval,
         },
-        Phase::Asleep | Phase::Startup if cfg.use_streaming => Action::Probe {
-            purpose: ProbePurpose::Wake,
-        },
-        Phase::Awake { .. } | Phase::Asleep | Phase::Startup => Action::VehicleData,
+        Phase::Checking { .. } | Phase::Asleep | Phase::Startup if cfg.use_streaming => {
+            Action::Probe {
+                purpose: ProbePurpose::Wake,
+            }
+        }
+        Phase::Awake { .. } | Phase::Checking { .. } | Phase::Asleep | Phase::Startup => {
+            Action::VehicleData
+        }
     }
 }
 
@@ -238,10 +261,20 @@ pub fn after_probe(
 ) -> ProbeOutcome {
     match purpose {
         ProbePurpose::Wake => match reading {
-            StreamReading::Sample(sample) if !wake_is_real(sample) => ProbeOutcome::Wait {
-                phase: Phase::Asleep,
-                wait: cfg.asleep_interval,
-            },
+            StreamReading::Sample(sample) if !wake_is_real(sample) => {
+                let since = match *phase {
+                    Phase::Checking { since } => since,
+                    _ => now,
+                };
+                if now.saturating_duration_since(since) >= cfg.subsystem_grace {
+                    ProbeOutcome::VehicleData
+                } else {
+                    ProbeOutcome::Wait {
+                        phase: Phase::Checking { since },
+                        wait: cfg.asleep_interval,
+                    }
+                }
+            }
             _ => ProbeOutcome::VehicleData,
         },
         ProbePurpose::Suspend => {
@@ -256,14 +289,11 @@ pub fn after_probe(
                 StreamReading::Sample(sample) if suspend_is_active(sample) => {
                     ProbeOutcome::VehicleData
                 }
-                StreamReading::Sample(_) => ProbeOutcome::Wait {
-                    phase: Phase::Suspended {
-                        idle_since,
-                        resume_at: None,
-                    },
-                    wait: cfg.asleep_interval,
-                },
-                StreamReading::Error | StreamReading::Timeout => ProbeOutcome::Wait {
+                // A parked row, an error, and a timeout all mean "this probe
+                // did not see use". Keep the first deadline. Clearing it let
+                // a stream that only answers with a parked row suppress
+                // logging until the process restarted.
+                _ => ProbeOutcome::Wait {
                     phase: Phase::Suspended {
                         idle_since,
                         resume_at: resume_at.or(Some(now + cfg.suspend_for)),
@@ -278,7 +308,7 @@ pub fn after_probe(
 pub fn apply_vehicle_data(data: &Value, phase: &Phase, now: Instant, cfg: &IdleConfig) -> Applied {
     let idle_since = match *phase {
         Phase::Awake { idle_since } | Phase::Suspended { idle_since, .. } => idle_since,
-        Phase::Startup | Phase::Asleep => now,
+        Phase::Startup | Phase::Asleep | Phase::Checking { .. } => now,
     };
     let activity = activity(data);
     match activity {
@@ -431,16 +461,20 @@ fn parse_f64(s: &str) -> Option<f64> {
     }
 }
 
-fn wake_is_real(sample: &StreamSample) -> bool {
+pub(crate) fn wake_is_real(sample: &StreamSample) -> bool {
     sample.power.is_some() || shift_or_speed(sample)
 }
 
-fn suspend_is_active(sample: &StreamSample) -> bool {
+pub(crate) fn suspend_is_active(sample: &StreamSample) -> bool {
     shift_or_speed(sample) || matches!(sample.power, Some(p) if p != 0.0)
 }
 
 fn shift_or_speed(sample: &StreamSample) -> bool {
     matches!(sample.shift.as_deref(), Some("D" | "R" | "N")) || sample.speed.unwrap_or(0.0) > 0.0
+}
+
+pub(crate) fn stream_is_driving(sample: &StreamSample) -> bool {
+    shift_or_speed(sample)
 }
 
 #[cfg(test)]
@@ -477,6 +511,7 @@ mod tests {
         assert_eq!(s.idle_before_suspend, Duration::from_secs(3 * 60));
         assert_eq!(s.suspend_for, Duration::from_secs(30 * 60));
         assert_eq!(s.idle_poll, Duration::from_secs(30));
+        assert_eq!(s.subsystem_grace, Duration::from_secs(5 * 60));
         let p = polling();
         assert_eq!(p.idle_before_suspend, Duration::from_secs(15 * 60));
         assert_eq!(p.suspend_for, Duration::from_secs(21 * 60));
@@ -543,22 +578,52 @@ mod tests {
             power: Some(0.0),
             shift: Some("P".into()),
         };
-        match after_probe(
+        let armed = match after_probe(
             ProbePurpose::Suspend,
-            &StreamReading::Sample(quiet),
+            &StreamReading::Sample(quiet.clone()),
             &suspended.phase,
             t3,
             &cfg,
         ) {
-            ProbeOutcome::Wait { phase, .. } => assert!(matches!(
-                phase,
-                Phase::Suspended {
-                    resume_at: None,
-                    ..
-                }
-            )),
+            ProbeOutcome::Wait { phase, .. } => phase,
             ProbeOutcome::VehicleData => panic!("quiet stream must not call vehicle_data"),
+        };
+        let Phase::Suspended {
+            resume_at: Some(until),
+            ..
+        } = armed
+        else {
+            panic!("quiet stream must arm a fallback, got {armed:?}");
+        };
+        assert_eq!(until, t3 + cfg.suspend_for);
+        let later = t3 + Duration::from_secs(10 * 60);
+        match after_probe(
+            ProbePurpose::Suspend,
+            &StreamReading::Sample(quiet),
+            &armed,
+            later,
+            &cfg,
+        ) {
+            ProbeOutcome::Wait {
+                phase:
+                    Phase::Suspended {
+                        resume_at: Some(still),
+                        ..
+                    },
+                ..
+            } => assert_eq!(
+                still, until,
+                "a later parked row must not move the deadline"
+            ),
+            other => panic!("expected the same deadline, got {other:?}"),
         }
+        assert!(matches!(
+            plan(&armed, "online", later, &cfg),
+            Action::Probe {
+                purpose: ProbePurpose::Suspend
+            }
+        ));
+        assert_eq!(plan(&armed, "online", until, &cfg), Action::VehicleData);
 
         assert!(matches!(
             plan(&suspended.phase, "asleep", t3, &cfg),
@@ -581,15 +646,36 @@ mod tests {
         assert_eq!(
             after_probe(
                 ProbePurpose::Wake,
-                &StreamReading::Sample(nil_power),
+                &StreamReading::Sample(nil_power.clone()),
                 &Phase::Asleep,
                 now,
                 &cfg
             ),
             ProbeOutcome::Wait {
-                phase: Phase::Asleep,
+                phase: Phase::Checking { since: now },
                 wait: cfg.asleep_interval,
             }
+        );
+        let checking = Phase::Checking { since: now };
+        assert!(matches!(
+            plan(&checking, "online", now + Duration::from_secs(60), &cfg),
+            Action::Probe {
+                purpose: ProbePurpose::Wake
+            }
+        ));
+        assert_eq!(
+            plan(&checking, "online", now + cfg.subsystem_grace, &cfg),
+            Action::VehicleData
+        );
+        assert_eq!(
+            after_probe(
+                ProbePurpose::Wake,
+                &StreamReading::Sample(nil_power),
+                &checking,
+                now + cfg.subsystem_grace,
+                &cfg
+            ),
+            ProbeOutcome::VehicleData
         );
         assert_eq!(
             after_probe(
