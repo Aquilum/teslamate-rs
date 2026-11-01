@@ -224,6 +224,62 @@ fn recalculate_costs(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn geofence_at(conn: &Connection, latitude: f64, longitude: f64) -> rusqlite::Result<Option<i64>> {
+    if !latitude.is_finite() || !longitude.is_finite() || (latitude == 0.0 && longitude == 0.0) {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare("SELECT id, latitude, longitude, radius FROM geofences")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Fence {
+            id: r.get(0)?,
+            latitude: r.get(1)?,
+            longitude: r.get(2)?,
+            radius: r.get::<_, i64>(3)? as f64,
+        })
+    })?;
+    let mut nearest: Option<(f64, i64)> = None;
+    for fence in rows {
+        let fence = fence?;
+        let distance = distance_m(latitude, longitude, fence.latitude, fence.longitude);
+        if distance <= fence.radius && nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, fence.id));
+        }
+    }
+    Ok(nearest.map(|(_, id)| id))
+}
+
+/// Label one charging session from its position and fill the geofence price
+/// when no invoice already owns the cost.
+pub fn price_charge_geofence(
+    conn: &Connection,
+    process_id: i64,
+    latitude: f64,
+    longitude: f64,
+) -> Result<()> {
+    let Some(id) = geofence_at(conn, latitude, longitude)? else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE charging_processes SET geofence_id=?1 WHERE id=?2",
+        params![id, process_id],
+    )?;
+    conn.execute(
+        "UPDATE charging_processes AS cp SET cost=(
+           SELECT CASE
+             WHEN g.cost_per_unit IS NULL AND g.session_fee IS NULL THEN NULL
+             WHEN g.billing_type='per_kwh' THEN COALESCE(g.session_fee, 0) +
+               COALESCE(g.cost_per_unit * MAX(COALESCE(cp.charge_energy_used, 0), COALESCE(cp.charge_energy_added, 0)), 0)
+             WHEN g.billing_type='per_minute' THEN COALESCE(g.session_fee, 0) +
+               COALESCE(g.cost_per_unit * cp.duration_min, 0)
+             ELSE NULL END FROM geofences g WHERE g.id=cp.geofence_id
+         ) WHERE cp.id=?1 AND NOT EXISTS (
+           SELECT 1 FROM charging_invoices i WHERE i.charging_process_id=cp.id
+         )",
+        [process_id],
+    )?;
+    Ok(())
+}
+
 fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let radians = |degrees: f64| degrees * PI / 180.0;
     let (lat1, lat2) = (radians(lat1), radians(lat2));
