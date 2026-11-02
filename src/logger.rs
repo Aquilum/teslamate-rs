@@ -327,6 +327,7 @@ async fn fetch_vehicle_data(
         let conn = db.lock();
         crate::live::record_snapshot(&conn, car.id, "online", Some(&data))?;
     }
+    record_update_history(db, car.id, &data);
     let applied = sleep::apply_vehicle_data(&data, &phase, Instant::now(), &car.cfg);
     match applied.activity {
         Activity::Charging => persist_charge_tick(db, car.id, &data)?,
@@ -364,6 +365,75 @@ async fn fetch_vehicle_data(
         info!("car {}: suspending logging so the car can sleep", car.id);
     }
     Ok((phase_out, applied.wait))
+}
+
+fn record_update_history(db: &Db, car_id: i64, data: &Value) {
+    let conn = db.lock();
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    match sync_updates(&conn, car_id, data, &now) {
+        Ok(Some(version)) => info!("car {car_id}: software {version}"),
+        Ok(None) => {}
+        Err(e) => warn!("car {car_id}: update history: {e:#}"),
+    }
+}
+
+/// TeslaMate imports keep the build hash ("2020.48.26 e0b5bf7f4a9d"); the
+/// car reports it too. Only the release number identifies an update.
+fn release(version: &str) -> Option<&str> {
+    version.split_whitespace().next()
+}
+
+/// Keeps `updates` in step with `vehicle_state.car_version`. An install that
+/// is seen opens a row, which the next reading closes with the new version;
+/// a version change that happened while the logger was not looking is
+/// recorded as an instant update, as TeslaMate does.
+fn sync_updates(conn: &Connection, car_id: i64, data: &Value, now: &str) -> Result<Option<String>> {
+    let status = tesla::str_field(data, &["vehicle_state", "software_update", "status"]).unwrap_or("");
+    let open: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM updates WHERE car_id=?1 AND end_date IS NULL
+             ORDER BY start_date DESC, id DESC LIMIT 1",
+            [car_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if status == "installing" {
+        if open.is_none() {
+            conn.execute(
+                "INSERT INTO updates (start_date, car_id) VALUES (?1, ?2)",
+                params![now, car_id],
+            )?;
+        }
+        return Ok(None);
+    }
+    let Some(version) = tesla::str_field(data, &["vehicle_state", "car_version"]).and_then(release)
+    else {
+        return Ok(None);
+    };
+    if let Some(id) = open {
+        conn.execute(
+            "UPDATE updates SET end_date=?1, version=?2 WHERE id=?3",
+            params![now, version, id],
+        )?;
+        return Ok(Some(version.to_string()));
+    }
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT version FROM updates
+             WHERE car_id=?1 AND version IS NOT NULL AND TRIM(version) <> ''
+             ORDER BY start_date DESC, id DESC LIMIT 1",
+            [car_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if last.as_deref().and_then(release) == Some(version) {
+        return Ok(None);
+    }
+    conn.execute(
+        "INSERT INTO updates (start_date, end_date, version, car_id) VALUES (?1, ?1, ?2, ?3)",
+        params![now, version, car_id],
+    )?;
+    Ok(Some(version.to_string()))
 }
 
 fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
@@ -425,6 +495,7 @@ fn finish_idle(db: &Db, car_id: i64, position_id: i64) -> Result<()> {
 
 /// One online poll: GPS snapshot plus drive/charge tick if that is what the car is doing.
 pub fn ingest_online(db: &Db, car_id: i64, data: &Value) -> Result<()> {
+    record_update_history(db, car_id, data);
     match sleep::activity(data) {
         Activity::Charging => persist_charge_tick(db, car_id, data),
         Activity::Driving => persist_drive_tick(db, car_id, data),
@@ -1101,6 +1172,67 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn records_software_updates_from_car_version() {
+        let conn = memory();
+        let reading = |status: &str, version: &str| {
+            json!({"vehicle_state": {
+                "car_version": version,
+                "software_update": {"status": status, "version": " "}
+            }})
+        };
+        let rows = |conn: &Connection| -> Vec<(String, Option<String>, Option<String>)> {
+            let mut stmt = conn
+                .prepare("SELECT start_date, end_date, version FROM updates ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        conn.execute(
+            "INSERT INTO updates (start_date, end_date, version, car_id)
+             VALUES ('2026-09-16 19:41:15', '2026-09-16 19:41:30', '2026.32.3 0a1b2c3d', 1)",
+            [],
+        )
+        .unwrap();
+
+        let same = sync_updates(&conn, 1, &reading("", "2026.32.3 9f8e7d6c"), "2026-11-01 08:00:00");
+        assert_eq!(same.unwrap(), None);
+        assert_eq!(rows(&conn).len(), 1);
+
+        let missed = sync_updates(&conn, 1, &reading("", "2026.38.3.2 abcdef12"), "2026-11-02 09:18:33");
+        assert_eq!(missed.unwrap().as_deref(), Some("2026.38.3.2"));
+        assert_eq!(
+            rows(&conn)[1],
+            (
+                "2026-11-02 09:18:33".into(),
+                Some("2026-11-02 09:18:33".into()),
+                Some("2026.38.3.2".into())
+            )
+        );
+        assert_eq!(
+            sync_updates(&conn, 1, &reading("", "2026.38.3.2 abcdef12"), "2026-11-02 10:00:00").unwrap(),
+            None
+        );
+
+        sync_updates(&conn, 1, &reading("installing", "2026.38.3.2 abcdef12"), "2026-11-10 02:00:00").unwrap();
+        sync_updates(&conn, 1, &reading("installing", "2026.38.3.2 abcdef12"), "2026-11-10 02:05:00").unwrap();
+        assert_eq!(rows(&conn)[2], ("2026-11-10 02:00:00".into(), None, None));
+        let done = sync_updates(&conn, 1, &reading("", "2026.44.1 1234abcd"), "2026-11-10 02:40:00");
+        assert_eq!(done.unwrap().as_deref(), Some("2026.44.1"));
+        let all = rows(&conn);
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[2],
+            (
+                "2026-11-10 02:00:00".into(),
+                Some("2026-11-10 02:40:00".into()),
+                Some("2026.44.1".into())
+            )
+        );
+    }
 
     #[test]
     fn strips_html_metacharacters_from_vehicle_names() {
