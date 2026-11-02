@@ -552,6 +552,7 @@ fn persist_drive_tick(db: &Db, car_id: i64, data: &Value) -> Result<()> {
     {
         let conn = db.lock();
         complete_open_charges(&conn, car_id)?;
+        close_stale_sessions(&conn, car_id)?;
     }
     let pos_id = persist_snapshot(db, car_id, data)?;
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
@@ -593,6 +594,7 @@ fn persist_charge_tick(db: &Db, car_id: i64, data: &Value) -> Result<()> {
         let conn = db.lock();
         attach_recent_position(&conn, car_id, pos_id)?;
         close_open_drives(&conn, car_id)?;
+        close_stale_sessions(&conn, car_id)?;
     }
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let conn = db.lock();
@@ -667,6 +669,47 @@ fn persist_charge_tick(db: &Db, car_id: i64, data: &Value) -> Result<()> {
             process_id
         ],
     )?;
+    Ok(())
+}
+
+/// An open drive or charge whose last reading is older than this is a
+/// session that ended unseen (an import, an outage, a car that slept), not
+/// the one the car is in now; extending it merges unrelated trips or
+/// charges into one row at the old location.
+const SESSION_GAP_MIN: i64 = 15;
+
+fn close_stale_sessions(conn: &Connection, car_id: i64) -> Result<()> {
+    let cutoff = format!("-{SESSION_GAP_MIN} minutes");
+    let stale_drives = {
+        let mut stmt = conn.prepare(
+            "SELECT d.id FROM drives d
+             WHERE d.car_id=?1 AND d.end_date IS NULL
+               AND COALESCE((SELECT MAX(p.date) FROM positions p WHERE p.drive_id=d.id), d.start_date)
+                   < datetime('now', ?2)",
+        )?;
+        let ids = stmt
+            .query_map(params![car_id, cutoff], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids
+    };
+    for id in stale_drives {
+        close_drive(conn, car_id, id)?;
+    }
+    let stale_charges = {
+        let mut stmt = conn.prepare(
+            "SELECT cp.id FROM charging_processes cp
+             WHERE cp.car_id=?1 AND cp.end_date IS NULL
+               AND COALESCE((SELECT MAX(c.date) FROM charges c WHERE c.charging_process_id=cp.id), cp.start_date)
+                   < datetime('now', ?2)",
+        )?;
+        let ids = stmt
+            .query_map(params![car_id, cutoff], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids
+    };
+    for id in stale_charges {
+        complete_charge(conn, car_id, id)?;
+    }
     Ok(())
 }
 
@@ -1510,6 +1553,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dangling, 0);
+    }
+
+    #[test]
+    fn a_stale_open_charge_is_closed_not_extended() {
+        let conn = memory();
+        let charge = |process: i64, date: &str, energy: f64| {
+            conn.execute(
+                "INSERT INTO charges (date, battery_level, charge_energy_added, charger_power,
+                                      ideal_battery_range_km, charging_process_id)
+                 VALUES (?1, 50, ?2, 7, 200, ?3)",
+                params![date, energy, process],
+            )
+            .unwrap();
+        };
+        let open = |start: &str| {
+            let pos = position(&conn, start, 52.28, 0.12, 3000.0, None);
+            conn.execute(
+                "INSERT INTO charging_processes (start_date, car_id, position_id, charge_energy_added)
+                 VALUES (?1, 1, ?2, 0)",
+                params![start, pos],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let old = open("2026-02-04 20:21:36");
+        charge(old, "2026-02-04 20:21:36", 0.0);
+        charge(old, "2026-02-04 21:20:29", 6.78);
+        let now = Utc::now();
+        let recent_start = (now - chrono::Duration::minutes(5)).format("%Y-%m-%d %H:%M:%S").to_string();
+        let current = open(&recent_start);
+        charge(current, &recent_start, 1.0);
+
+        close_stale_sessions(&conn, 1).unwrap();
+
+        let ends = |id: i64| -> Option<String> {
+            conn.query_row("SELECT end_date FROM charging_processes WHERE id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(ends(old).as_deref(), Some("2026-02-04 21:20:29"));
+        assert_eq!(ends(current), None);
     }
 
     #[test]
