@@ -41,6 +41,8 @@ override_dh_auto_install:
 		debian/teslamate-rs/lib/systemd/system/teslamate-rs-pam.socket
 	install -D -m 0644 debian/teslamate-rs-pam@.service \
 		debian/teslamate-rs/lib/systemd/system/teslamate-rs-pam@.service
+	install -D -m 0644 debian/teslamate-rs-holding.html \
+		debian/teslamate-rs/usr/share/teslamate-rs/holding.html
 
 override_dh_auto_clean:
 	rm -rf debian/cargo-target debian/pamlib
