@@ -1,3 +1,10 @@
+teslamate-rs (0.4.7-1) UNRELEASED; urgency=medium
+
+  * Read the outside temperature and battery heater for charges from
+    climate_state, and record each charge's average outside temperature.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 02 Nov 2026 19:00:00 +0000
+
 teslamate-rs (0.4.6-1) UNRELEASED; urgency=medium
 
   * Close an open drive or charge whose last reading is over 15 minutes old
