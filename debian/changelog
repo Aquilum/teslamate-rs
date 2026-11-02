@@ -1,3 +1,12 @@
+teslamate-rs (0.4.5-1) UNRELEASED; urgency=medium
+
+  * Show text stat fields such as the firmware version when a panel selects
+    fields by regex, as Grafana does.
+  * Keep the last vehicle reading when the car answers with cached data only.
+  * Record a release from the last stored reading at startup.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 02 Nov 2026 14:50:00 +0000
+
 teslamate-rs (0.4.4-1) UNRELEASED; urgency=medium
 
   * Record software updates from the car's reported version.
