@@ -509,7 +509,7 @@ fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
             tesla::bool_field(data, &["climate_state", "is_front_defroster_on"]).map(|b| b as i64),
             car_id,
             tesla::f64_field(data, &["climate_state", "inside_temp"]),
-            tesla::bool_field(data, &["charge_state", "battery_heater"]).map(|b| b as i64),
+            tesla::bool_field(data, &["climate_state", "battery_heater"]).map(|b| b as i64),
             tesla::bool_field(data, &["charge_state", "battery_heater_on"]).map(|b| b as i64),
             tesla::f64_field(data, &["charge_state", "est_battery_range"]).map(|m| m * 1.60934),
             tesla::f64_field(data, &["charge_state", "battery_range"]).map(|m| m * 1.60934),
@@ -653,9 +653,9 @@ fn persist_charge_tick(db: &Db, car_id: i64, data: &Value) -> Result<()> {
             tesla::str_field(data, &["charge_state", "fast_charger_brand"]),
             tesla::str_field(data, &["charge_state", "fast_charger_type"]),
             ideal,
-            tesla::f64_field(data, &["charge_state", "outside_temp"]),
+            tesla::f64_field(data, &["climate_state", "outside_temp"]),
             process_id,
-            tesla::bool_field(data, &["charge_state", "battery_heater"]).map(|b| b as i64),
+            tesla::bool_field(data, &["climate_state", "battery_heater"]).map(|b| b as i64),
             tesla::f64_field(data, &["charge_state", "battery_range"]).map(|m| m * 1.60934),
             tesla::i64_field(data, &["charge_state", "usable_battery_level"]),
         ],
@@ -978,7 +978,10 @@ fn complete_charge(conn: &Connection, car_id: i64, process_id: i64) -> Result<()
         "UPDATE charging_processes SET
             end_date=?1, duration_min=?2, end_battery_level=?3,
             end_ideal_range_km=?4, end_rated_range_km=?5,
-            charge_energy_added=?6, charge_energy_used=COALESCE(?7, charge_energy_used)
+            charge_energy_added=?6, charge_energy_used=COALESCE(?7, charge_energy_used),
+            outside_temp_avg=COALESCE(
+                (SELECT AVG(outside_temp) FROM charges WHERE charging_process_id=?8),
+                outside_temp_avg)
          WHERE id=?8",
         params![
             end_date,
@@ -1593,6 +1596,33 @@ mod tests {
         };
         assert_eq!(ends(old).as_deref(), Some("2026-02-04 21:20:29"));
         assert_eq!(ends(current), None);
+    }
+
+    #[test]
+    fn completing_a_charge_averages_the_outside_temperature() {
+        let conn = memory();
+        let pos = position(&conn, "2026-10-02 22:00:00", 51.5, -0.12, 3000.0, None);
+        conn.execute(
+            "INSERT INTO charging_processes (start_date, car_id, position_id, charge_energy_added)
+             VALUES ('2026-10-02 22:00:00', 1, ?1, 0)",
+            [pos],
+        )
+        .unwrap();
+        let process = conn.last_insert_rowid();
+        for (date, temp) in [("2026-10-02 22:00:00", Some(10.0)), ("2026-10-02 22:30:00", None), ("2026-10-02 23:00:00", Some(12.0))] {
+            conn.execute(
+                "INSERT INTO charges (date, battery_level, charge_energy_added, charger_power,
+                                      ideal_battery_range_km, outside_temp, charging_process_id)
+                 VALUES (?1, 50, 1, 7, 200, ?2, ?3)",
+                params![date, temp, process],
+            )
+            .unwrap();
+        }
+        complete_charge(&conn, 1, process).unwrap();
+        let avg: Option<f64> = conn
+            .query_row("SELECT outside_temp_avg FROM charging_processes WHERE id=?1", [process], |r| r.get(0))
+            .unwrap();
+        assert_eq!(avg, Some(11.0));
     }
 
     #[test]
