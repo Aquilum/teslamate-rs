@@ -126,9 +126,104 @@ fn open_conn(path: &Path, apply_schema: bool) -> Result<Connection> {
         conn.execute_batch(include_str!("../schema.sql"))?;
         // Older DBs created sessions without last_seen.
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN last_seen TEXT", []);
+        // `positions(date)` duplicated `positions(car_id, date)` for a single car
+        // and was updated on every streamed point.
+        conn.execute_batch("DROP INDEX IF EXISTS positions_date;")?;
     }
     register_functions(&conn)?;
     Ok(conn)
+}
+
+/// Streamed GPS rows are stored at most once per this many seconds.
+pub const STREAM_SAMPLE_SECS: i64 = 5;
+
+pub struct CompactStats {
+    pub before: i64,
+    pub after: i64,
+    pub removed: i64,
+}
+
+/// Drop leftover date index, keep one ideal-range-less position per
+/// `STREAM_SAMPLE_SECS` bucket, and rewrite the file so the free pages are
+/// returned to the filesystem. Call with no other connection open.
+pub fn compact_database(path: &Path) -> Result<CompactStats> {
+    let conn = open_conn(path, true).with_context(|| format!("open {}", path.display()))?;
+    compact_stream_positions(&conn)
+}
+
+fn compact_stream_positions(conn: &Connection) -> Result<CompactStats> {
+    let before: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))?;
+    tracing::info!(
+        "compacting positions ({before} rows); keeping one streamed point per {STREAM_SAMPLE_SECS}s"
+    );
+    // One statement over every GPS row holds a single transaction for the whole
+    // delete. Commit per drive so a stop keeps finished drives and the log moves.
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS positions_date;
+         CREATE TEMP TABLE pos_ref (id INTEGER PRIMARY KEY);
+         INSERT OR IGNORE INTO pos_ref
+           SELECT start_position_id FROM drives WHERE start_position_id IS NOT NULL;
+         INSERT OR IGNORE INTO pos_ref
+           SELECT end_position_id FROM drives WHERE end_position_id IS NOT NULL;
+         INSERT OR IGNORE INTO pos_ref
+           SELECT position_id FROM charging_processes;",
+    )?;
+    let drive_ids: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT drive_id FROM positions WHERE drive_id IS NOT NULL")?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        ids
+    };
+    let drive_count = drive_ids.len();
+    let mut removed = 0i64;
+    for (i, drive_id) in drive_ids.into_iter().enumerate() {
+        removed += conn.execute(
+            "DELETE FROM positions
+             WHERE drive_id=?1
+               AND ideal_battery_range_km IS NULL
+               AND id NOT IN (SELECT id FROM pos_ref)
+               AND id NOT IN (
+                 SELECT MIN(id) FROM positions
+                 WHERE drive_id=?1 AND ideal_battery_range_km IS NULL
+                 GROUP BY unixepoch(date) / ?2
+               )",
+            rusqlite::params![drive_id, STREAM_SAMPLE_SECS],
+        )? as i64;
+        if (i + 1) % 100 == 0 || i + 1 == drive_count {
+            tracing::info!(
+                "compacted drives {}/{drive_count} (removed {removed})",
+                i + 1
+            );
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        }
+    }
+    removed += conn.execute(
+        "DELETE FROM positions
+         WHERE drive_id IS NULL
+           AND ideal_battery_range_km IS NULL
+           AND id NOT IN (SELECT id FROM pos_ref)
+           AND id NOT IN (
+             SELECT MIN(id) FROM positions
+             WHERE drive_id IS NULL AND ideal_battery_range_km IS NULL
+             GROUP BY car_id, unixepoch(date) / ?1
+           )",
+        [STREAM_SAMPLE_SECS],
+    )? as i64;
+    conn.execute_batch("DROP TABLE pos_ref;")?;
+    let after_delete: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))?;
+    if before > 0 && after_delete == 0 {
+        anyhow::bail!("refusing to vacuum: compact removed every position");
+    }
+    tracing::info!("vacuuming after removing {removed} positions");
+    conn.execute_batch("VACUUM;")?;
+    let after: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))?;
+    Ok(CompactStats {
+        before,
+        after,
+        removed,
+    })
 }
 
 const HOURLY_INSERT: &str = "INSERT OR REPLACE INTO position_hourly (
@@ -606,7 +701,7 @@ pub fn default_db_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::osm_city;
+    use super::{compact_stream_positions, open_conn, osm_city};
 
     #[test]
     fn prefers_nominatim_town_over_district_city() {
@@ -641,5 +736,80 @@ mod tests {
             osm_city(None, Some("Cambridgeshire"), Some("Cambridgeshire")),
             None
         );
+    }
+
+    #[test]
+    fn compact_keeps_one_stream_sample_and_referenced_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "tm-compact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sqlite");
+        let conn = open_conn(&path, true).unwrap();
+        conn.execute("INSERT INTO car_settings (id) VALUES (1)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cars (id, eid, vid, inserted_at, updated_at, vin, settings_id)
+             VALUES (1, 1, 1, '2024-01-01', '2024-01-01', 'VIN', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX positions_date ON positions(date)", [])
+            .unwrap();
+        let mut ids = Vec::new();
+        for (date, ideal) in [
+            ("2024-01-01 00:00:00", None::<f64>),
+            ("2024-01-01 00:00:01", None),
+            ("2024-01-01 00:00:01", Some(10.0)),
+            ("2024-01-01 00:00:04", None),
+            ("2024-01-01 00:00:05", None),
+        ] {
+            conn.execute(
+                "INSERT INTO positions (date, latitude, longitude, car_id, drive_id, ideal_battery_range_km)
+                 VALUES (?1, 0, 0, 1, 1, ?2)",
+                rusqlite::params![date, ideal],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+        conn.execute(
+            "INSERT INTO drives (id, start_date, car_id, start_position_id) VALUES (1, '2024-01-01', 1, ?1)",
+            [ids[1]],
+        )
+        .unwrap();
+        let stats = compact_stream_positions(&conn).unwrap();
+        assert_eq!(stats.before, 5);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.after, 4);
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='positions_date'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 0);
+        let dates: Vec<String> = conn
+            .prepare("SELECT date FROM positions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            dates,
+            vec![
+                "2024-01-01 00:00:00".to_string(),
+                "2024-01-01 00:00:01".to_string(),
+                "2024-01-01 00:00:01".to_string(),
+                "2024-01-01 00:00:05".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

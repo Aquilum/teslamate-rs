@@ -110,6 +110,8 @@ enum Cmd {
     },
     /// Schema + row counts
     Doctor,
+    /// Thin streamed GPS history to one point per five seconds and vacuum
+    Compact,
 }
 
 fn point_at_mock(bind: &str, mock_port: u16) {
@@ -161,6 +163,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if matches!(&cli.cmd, Cmd::PamCheck) {
         return pam_auth::run_stdio_check().map_err(|e| anyhow::anyhow!(e.to_string()));
+    }
+    if matches!(&cli.cmd, Cmd::Compact) {
+        let db_path = cli.db.clone().unwrap_or_else(db::default_db_path);
+        let stats = db::compact_database(&db_path)?;
+        println!(
+            "positions {} -> {} (removed {}) in {}",
+            stats.before,
+            stats.after,
+            stats.removed,
+            db_path.display()
+        );
+        return Ok(());
     }
     let db_path = cli.db.unwrap_or_else(db::default_db_path);
     let db = db::open(&db_path)?;
@@ -270,6 +284,7 @@ async fn main() -> Result<()> {
             println!("db: {}", db_path.display());
             print!("{}", import::summarize(&conn)?);
         }
+        Cmd::Compact => unreachable!("handled before opening the database"),
     }
     Ok(())
 }

@@ -214,7 +214,6 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 
 CREATE INDEX IF NOT EXISTS positions_car_id_date ON positions(car_id, date);
 CREATE INDEX IF NOT EXISTS positions_drive_id_date ON positions(drive_id, date);
-CREATE INDEX IF NOT EXISTS positions_date ON positions(date);
 CREATE INDEX IF NOT EXISTS drives_car_id_start ON drives(car_id, start_date);
 CREATE INDEX IF NOT EXISTS charges_process_date ON charges(charging_process_id, date);
 CREATE INDEX IF NOT EXISTS charging_processes_car_start ON charging_processes(car_id, start_date);

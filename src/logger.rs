@@ -15,6 +15,14 @@ const STREAM_COLUMNS: &str =
     "speed,odometer,soc,elevation,est_heading,est_lat,est_lng,power,shift_state,range,est_range,heading";
 const STREAM_IDLE: Duration = Duration::from_secs(90);
 
+/// True when `now_unix` is at least one stream bucket after the previous stored point.
+fn stream_sample_due(last_unix: Option<i64>, now_unix: i64) -> bool {
+    match last_unix {
+        None => true,
+        Some(last) => now_unix.saturating_sub(last) >= crate::db::STREAM_SAMPLE_SECS,
+    }
+}
+
 /// Strip HTML/script-friendly punctuation from Tesla display names before storage.
 pub fn sanitize_vehicle_name(raw: &str) -> String {
     let cleaned: String = raw
@@ -1140,7 +1148,8 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
     let lat: f64 = cols[5].parse().unwrap_or(0.0);
     let lon: f64 = cols[6].parse().unwrap_or(0.0);
     let power: Option<i64> = cols[7].parse().ok();
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let now = Utc::now();
+    let now_s = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let conn = db.lock();
     let drive_id: Option<i64> = conn
         .query_row(
@@ -1149,11 +1158,32 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
             |r| r.get(0),
         )
         .optional()?;
+    let last_unix: Option<i64> = match drive_id {
+        Some(id) => conn
+            .query_row(
+                "SELECT unixepoch(date) FROM positions WHERE drive_id=?1 ORDER BY date DESC LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?,
+        None => conn
+            .query_row(
+                "SELECT unixepoch(date) FROM positions
+                 WHERE car_id=?1 AND drive_id IS NULL
+                 ORDER BY date DESC LIMIT 1",
+                [car_id],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
+    if !stream_sample_due(last_unix, now.timestamp()) {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO positions (date, latitude, longitude, speed, power, odometer, battery_level, elevation, car_id, drive_id)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
-            now,
+            now_s,
             lat,
             lon,
             speed,
@@ -1172,6 +1202,13 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn stream_keeps_a_point_every_five_seconds() {
+        assert!(super::stream_sample_due(None, 1_000));
+        assert!(!super::stream_sample_due(Some(1_000), 1_004));
+        assert!(super::stream_sample_due(Some(1_000), 1_005));
+    }
 
     #[test]
     fn records_software_updates_from_car_version() {
