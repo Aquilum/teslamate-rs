@@ -1,3 +1,35 @@
+teslamate-rs (0.4.4-1) UNRELEASED; urgency=medium
+
+  * Record software updates from the car's reported version.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 02 Nov 2026 09:30:00 +0000
+
+teslamate-rs (0.4.3-1) UNRELEASED; urgency=medium
+
+  * Encode the vehicle_data endpoint list so Tesla returns vehicle_state
+    (odometer, software version) instead of only charge_state.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 02 Nov 2026 00:10:00 +0000
+
+teslamate-rs (0.4.2-1) UNRELEASED; urgency=medium
+
+  * Close open drives and charges, and keep logging after a quiet stream.
+
+ -- Tom Dewey <tom@fleetcom.org>  Sun, 01 Nov 2026 21:10:00 +0000
+
+teslamate-rs (0.4.1-1) UNRELEASED; urgency=medium
+
+  * Show an nginx holding page while teslamate-rs is down.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 26 Oct 2026 21:18:37 +0000
+
+teslamate-rs (0.4.0-1) UNRELEASED; urgency=medium
+
+  * Drop the redundant positions date index.
+  * Keep one streamed GPS point every five seconds and compact existing history.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 26 Oct 2026 20:30:00 +0000
+
 teslamate-rs (0.3.0-1) UNRELEASED; urgency=medium
 
   * Suspend Owner API logging so a parked car can sleep.
