@@ -935,8 +935,12 @@ function reduceField(rows, col, calc) {
     const n = num(r[col]);
     if (n != null) vals.push(n);
   }
-  if (!vals.length) return (rows || [])[0]?.[col];
   const name = String(calc || "lastNotNull").toLowerCase();
+  if (!vals.length) {
+    const present = (rows || []).map((r) => r[col]).filter((v) => v != null && v !== "");
+    if (!present.length) return (rows || [])[0]?.[col];
+    return name.startsWith("first") ? present[0] : present[present.length - 1];
+  }
   if (name === "sum") return vals.reduce((a, b) => a + b, 0);
   if (name === "mean" || name === "avg") return vals.reduce((a, b) => a + b, 0) / vals.length;
   if (name === "max") return Math.max(...vals);
@@ -1156,8 +1160,23 @@ function drawStat(body, panel, cols, rows, type) {
   const show = prettyCols(cols, panel);
   const metricCol = show.find((c) => /^(metric|name)$/i.test(c));
   let fields = show.filter((c) => c !== metricCol && c !== "time");
-  const numeric = fields.filter((c) => rows.some((r) => num(r[c]) != null));
-  if (numeric.length) fields = numeric;
+  // Grafana's default ("") reduces numeric fields only; a /regex/ selects
+  // fields by name and keeps text values such as a firmware version.
+  const fieldsOpt = String(panel.options?.reduceOptions?.fields || "");
+  const fieldsRe = /^\/(.+)\/([a-z]*)$/.exec(fieldsOpt);
+  if (fieldsRe) {
+    let re = null;
+    try {
+      re = new RegExp(fieldsRe[1], fieldsRe[2]);
+    } catch {
+      re = null;
+    }
+    const picked = re ? fields.filter((c) => re.test(c)) : [];
+    if (picked.length) fields = picked;
+  } else {
+    const numeric = fields.filter((c) => rows.some((r) => num(r[c]) != null));
+    if (numeric.length) fields = numeric;
+  }
   if (wantTime) {
     const tcol = cols.find((c) => c === "time" || c === "date") || fields[0];
     fields = tcol ? [tcol] : fields;
