@@ -1,3 +1,10 @@
+teslamate-rs (0.4.6-1) UNRELEASED; urgency=medium
+
+  * Close an open drive or charge whose last reading is over 15 minutes old
+    instead of extending it with a new session.
+
+ -- Tom Dewey <tom@fleetcom.org>  Mon, 02 Nov 2026 15:45:00 +0000
+
 teslamate-rs (0.4.5-1) UNRELEASED; urgency=medium
 
   * Show text stat fields such as the firmware version when a panel selects
