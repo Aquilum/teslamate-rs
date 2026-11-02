@@ -228,11 +228,8 @@ impl Tesla {
 
     pub async fn vehicle_data(&mut self, id: i64) -> Result<Value> {
         self.ensure_fresh().await?;
-        let path = format!(
-            "/api/1/vehicles/{id}/vehicle_data?endpoints=charge_state;climate_state;closures_state;drive_state;gui_settings;location_data;vehicle_config;vehicle_state;vehicle_data_combo"
-        );
         Ok(self
-            .get(&path)
+            .get(&vehicle_data_path(id))
             .await?
             .get("response")
             .cloned()
@@ -463,6 +460,28 @@ pub fn str_field<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
     cur.as_str()
 }
 
+/// Owner API data groups. Tesla splits a raw `;` in the query as another
+/// parameter, so an unencoded list is delivered as `endpoints=charge_state`
+/// and `vehicle_state` (odometer, software version) never arrives.
+const VEHICLE_DATA_ENDPOINTS: &[&str] = &[
+    "charge_state",
+    "climate_state",
+    "closures_state",
+    "drive_state",
+    "gui_settings",
+    "location_data",
+    "vehicle_config",
+    "vehicle_state",
+    "vehicle_data_combo",
+];
+
+fn vehicle_data_path(id: i64) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("endpoints", &VEHICLE_DATA_ENDPOINTS.join(";"))
+        .finish();
+    format!("/api/1/vehicles/{id}/vehicle_data?{query}")
+}
+
 fn redact_path(path: &str) -> String {
     let (base, query) = path.split_once('?').unwrap_or((path, ""));
     let redacted = base
@@ -480,6 +499,24 @@ fn redact_path(path: &str) -> String {
         redacted
     } else {
         format!("{redacted}?{query}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vehicle_data_encodes_endpoint_separators() {
+        let path = vehicle_data_path(42);
+        let url = url::Url::parse(&format!("{OWNER_API}{path}")).unwrap();
+        let query = url.query().unwrap();
+        assert!(!query.contains(';'), "{query}");
+        let pairs: Vec<_> = url.query_pairs().collect();
+        assert_eq!(pairs.len(), 1, "{query}");
+        assert_eq!(pairs[0].0, "endpoints");
+        assert_eq!(pairs[0].1, VEHICLE_DATA_ENDPOINTS.join(";"));
+        assert!(pairs[0].1.contains("vehicle_state"));
     }
 }
 
