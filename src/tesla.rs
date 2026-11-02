@@ -518,6 +518,24 @@ mod tests {
         assert_eq!(pairs[0].1, VEHICLE_DATA_ENDPOINTS.join(";"));
         assert!(pairs[0].1.contains("vehicle_state"));
     }
+
+    #[test]
+    fn cached_only_reply_has_no_live_state() {
+        let sleepy = serde_json::json!({
+            "state": "online", "cached_data": "", "last_seen": 1793611562,
+            "charge_state": null, "vehicle_state": null
+        });
+        assert!(!has_live_state(&sleepy));
+        assert!(has_live_state(&serde_json::json!({"charge_state": {"battery_level": 50}})));
+    }
+}
+
+/// A car that is falling asleep can answer vehicle_data with only
+/// `cached_data` and `last_seen`: no state groups at all.
+pub fn has_live_state(data: &Value) -> bool {
+    ["charge_state", "climate_state", "drive_state", "vehicle_state"]
+        .iter()
+        .any(|k| data.get(*k).is_some_and(Value::is_object))
 }
 
 pub fn bool_field(v: &Value, path: &[&str]) -> Option<bool> {

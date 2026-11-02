@@ -167,6 +167,9 @@ pub async fn run(db: Db) {
     if let Err(e) = repair_open_sessions(&db) {
         warn!("logger: open sessions: {e:#}");
     }
+    if let Err(e) = sync_updates_from_snapshots(&db) {
+        warn!("logger: update history: {e:#}");
+    }
     let mut tracked: HashMap<i64, Tracked> = HashMap::new();
     loop {
         let delay = match load_tokens(&db) {
@@ -331,6 +334,9 @@ async fn fetch_vehicle_data(
     phase: Phase,
 ) -> Result<(Phase, Duration)> {
     let data = tesla.vehicle_data(car.vid).await?;
+    if !tesla::has_live_state(&data) {
+        anyhow::bail!("vehicle_data had no live state; keeping the last reading");
+    }
     {
         let conn = db.lock();
         crate::live::record_snapshot(&conn, car.id, "online", Some(&data))?;
@@ -383,6 +389,31 @@ fn record_update_history(db: &Db, car_id: i64, data: &Value) {
         Ok(None) => {}
         Err(e) => warn!("car {car_id}: update history: {e:#}"),
     }
+}
+
+/// The last vehicle_data reading may hold a release the history has not
+/// seen (a car that sleeps right after an upgrade); date it when it was read.
+fn sync_updates_from_snapshots(db: &Db) -> Result<()> {
+    let conn = db.lock();
+    let snaps: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT car_id, detail_at, data_json FROM vehicle_snapshots
+             WHERE detail_at IS NOT NULL AND data_json IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (car_id, detail_at, json) in snaps {
+        let Ok(data) = serde_json::from_str::<Value>(&json) else {
+            continue;
+        };
+        if let Some(version) = sync_updates(&conn, car_id, &data, &detail_at)? {
+            info!("car {car_id}: software {version} (from the last reading)");
+        }
+    }
+    Ok(())
 }
 
 /// TeslaMate imports keep the build hash ("2020.48.26 e0b5bf7f4a9d"); the
@@ -503,6 +534,9 @@ fn finish_idle(db: &Db, car_id: i64, position_id: i64) -> Result<()> {
 
 /// One online poll: GPS snapshot plus drive/charge tick if that is what the car is doing.
 pub fn ingest_online(db: &Db, car_id: i64, data: &Value) -> Result<()> {
+    if !tesla::has_live_state(data) {
+        anyhow::bail!("vehicle_data had no live state");
+    }
     record_update_history(db, car_id, data);
     match sleep::activity(data) {
         Activity::Charging => persist_charge_tick(db, car_id, data),
