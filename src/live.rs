@@ -338,12 +338,15 @@ fn battery_block(
         extras.push(json!({"label": "Charge port", "value": "open"}));
     }
     if tesla::bool_field(d, &["charge_state", "scheduled_charging_pending"]) == Some(true) {
-        let when = tesla::str_field(d, &["charge_state", "scheduled_charging_start_time"])
-            .unwrap_or("pending");
+        let when = tesla::i64_field(d, &["charge_state", "scheduled_charging_start_time"])
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "pending".into());
         extras.push(json!({"label": "Scheduled charging", "value": when}));
     }
     if let Some(rate) = tesla::f64_field(d, &["charge_state", "charge_rate"]) {
         if rate > 0.0 {
+            let rate = miles(rate, length);
             extras.push(json!({"label": "Charge rate", "value": format!("{rate:.0} {length}/h")}));
         }
     }
@@ -775,6 +778,32 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn charge_extras_use_owner_api_units() {
+        let d = json!({"charge_state": {
+            "charge_rate": 20.0,
+            "scheduled_charging_pending": true,
+            "scheduled_charging_start_time": 1_798_765_200,
+        }});
+        let mut extras = Vec::new();
+        battery_block(Some(&d), None, "km", "rated", &mut extras);
+        let value = |label: &str| {
+            extras
+                .iter()
+                .find(|e| e["label"] == label)
+                .and_then(|e| e["value"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(value("Charge rate"), "32 km/h");
+        let expected = chrono::DateTime::from_timestamp(1_798_765_200, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert_eq!(value("Scheduled charging"), expected);
     }
 
     #[test]

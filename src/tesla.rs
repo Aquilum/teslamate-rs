@@ -207,18 +207,16 @@ impl Tesla {
     }
 
     pub async fn products(&mut self) -> Result<Vec<Value>> {
-        self.ensure_fresh().await?;
         self.list_path("/api/1/products").await
     }
 
     pub async fn vehicles(&mut self) -> Result<Vec<Value>> {
-        self.ensure_fresh().await?;
         self.list_path("/api/1/vehicles").await
     }
 
-    async fn list_path(&self, path: &str) -> Result<Vec<Value>> {
+    async fn list_path(&mut self, path: &str) -> Result<Vec<Value>> {
         let v = self
-            .get(path)
+            .get_authorized(path)
             .await?
             .get("response")
             .cloned()
@@ -227,39 +225,54 @@ impl Tesla {
     }
 
     pub async fn vehicle_data(&mut self, id: i64) -> Result<Value> {
-        self.ensure_fresh().await?;
-        Ok(self
-            .get(&vehicle_data_path(id))
-            .await?
-            .get("response")
-            .cloned()
-            .unwrap_or(Value::Null))
+        self.response(&vehicle_data_path(id)).await
     }
 
     pub async fn vehicle(&mut self, id: i64) -> Result<Value> {
-        self.ensure_fresh().await?;
-        Ok(self
-            .get(&format!("/api/1/vehicles/{id}"))
-            .await?
-            .get("response")
-            .cloned()
-            .unwrap_or(Value::Null))
+        self.response(&format!("/api/1/vehicles/{id}")).await
     }
 
     /// Nearby Superchargers / destination chargers. Vehicle must already be online.
     pub async fn nearby_charging_sites(&mut self, id: i64) -> Result<Value> {
-        self.ensure_fresh().await?;
+        self.response(&format!("/api/1/vehicles/{id}/nearby_charging_sites"))
+            .await
+    }
+
+    async fn response(&mut self, path: &str) -> Result<Value> {
         Ok(self
-            .get(&format!("/api/1/vehicles/{id}/nearby_charging_sites"))
+            .get_authorized(path)
             .await?
             .get("response")
             .cloned()
             .unwrap_or(Value::Null))
+    }
+
+    /// Tesla can revoke an access token before `expires_at` (password change,
+    /// session reset); refresh once instead of failing until it expires.
+    async fn get_authorized(&mut self, path: &str) -> Result<Value> {
+        self.ensure_fresh().await?;
+        match self.get(path).await {
+            Err(e) if is_unauthorized(&e) => {
+                self.force_refresh().await?;
+                self.get(path).await
+            }
+            other => other,
+        }
     }
 
     /// Account Supercharger invoices. Does not call vehicle_data (will not wake the car).
     pub async fn charging_history_page(&mut self, vin: &str, page: i64) -> Result<Value> {
         self.ensure_fresh().await?;
+        match self.charging_history_once(vin, page).await {
+            Err(e) if is_unauthorized(&e) => {
+                self.force_refresh().await?;
+                self.charging_history_once(vin, page).await
+            }
+            other => other,
+        }
+    }
+
+    async fn charging_history_once(&self, vin: &str, page: i64) -> Result<Value> {
         match self.charging_history_graphql(vin, page).await {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -297,19 +310,12 @@ impl Tesla {
     }
 
     pub async fn users_me(&mut self) -> Result<Value> {
-        self.ensure_fresh().await?;
-        Ok(self
-            .get("/api/1/users/me")
-            .await?
-            .get("response")
-            .cloned()
-            .unwrap_or(Value::Null))
+        self.response("/api/1/users/me").await
     }
 
     pub async fn mobile_enabled(&mut self, id: i64) -> Result<bool> {
-        self.ensure_fresh().await?;
         let v = self
-            .get(&format!("/api/1/vehicles/{id}/mobile_enabled"))
+            .get_authorized(&format!("/api/1/vehicles/{id}/mobile_enabled"))
             .await?;
         Ok(v.get("response").and_then(|x| x.as_bool()).unwrap_or(false))
     }
@@ -327,13 +333,13 @@ impl Tesla {
             .await
             .with_context(|| format!("GET {label}"))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if status.is_redirection() {
             bail!("GET {label} redirected ({status}); refusing to follow with bearer token");
         }
         if !status.is_success() {
-            bail!("GET {label} -> {status}");
+            return Err(ApiError::new(&format!("GET {label}"), &resp).into());
         }
+        let body = resp.text().await.unwrap_or_default();
         serde_json::from_str(&body).with_context(|| format!("decode {label}"))
     }
 
@@ -348,13 +354,13 @@ impl Tesla {
             .await
             .context("GET charging-history")?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if status.is_redirection() {
             bail!("GET charging-history redirected ({status}); refusing to follow with bearer token");
         }
         if !status.is_success() {
-            bail!("GET charging-history -> {status}");
+            return Err(ApiError::new("GET charging-history", &resp).into());
         }
+        let body = resp.text().await.unwrap_or_default();
         serde_json::from_str(&body).context("decode charging-history")
     }
 
@@ -370,13 +376,13 @@ impl Tesla {
             .await
             .context("POST charging-history")?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if status.is_redirection() {
             bail!("POST charging-history redirected ({status}); refusing to follow with bearer token");
         }
         if !status.is_success() {
-            bail!("POST charging-history -> {status}");
+            return Err(ApiError::new("POST charging-history", &resp).into());
         }
+        let text = resp.text().await.unwrap_or_default();
         let v: Value = serde_json::from_str(&text).context("decode charging-history graphql")?;
         if v.get("errors").is_some() {
             bail!("POST charging-history graphql errors");
@@ -482,6 +488,56 @@ fn vehicle_data_path(id: i64) -> String {
     format!("/api/1/vehicles/{id}/vehicle_data?{query}")
 }
 
+/// A non-2xx reply, kept typed so callers can refresh on 401 and back off on 429.
+#[derive(Debug)]
+pub struct ApiError {
+    label: String,
+    status: reqwest::StatusCode,
+    retry_after: Option<std::time::Duration>,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} -> {}", self.label, self.status)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl ApiError {
+    fn new(label: &str, resp: &reqwest::Response) -> Self {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+        Self {
+            label: label.to_string(),
+            status: resp.status(),
+            retry_after,
+        }
+    }
+}
+
+fn api_error(e: &anyhow::Error) -> Option<&ApiError> {
+    e.chain().find_map(|c| c.downcast_ref::<ApiError>())
+}
+
+fn is_unauthorized(e: &anyhow::Error) -> bool {
+    api_error(e).is_some_and(|a| a.status == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+const RATE_LIMIT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(300);
+const RATE_LIMIT_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long Tesla asked us to wait, if `e` is a 429.
+pub fn rate_limited_for(e: &anyhow::Error) -> Option<std::time::Duration> {
+    api_error(e)
+        .filter(|a| a.status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .map(|a| a.retry_after.unwrap_or(RATE_LIMIT_DEFAULT).min(RATE_LIMIT_MAX))
+}
+
 fn redact_path(path: &str) -> String {
     let (base, query) = path.split_once('?').unwrap_or((path, ""));
     let redacted = base
@@ -517,6 +573,25 @@ mod tests {
         assert_eq!(pairs[0].0, "endpoints");
         assert_eq!(pairs[0].1, VEHICLE_DATA_ENDPOINTS.join(";"));
         assert!(pairs[0].1.contains("vehicle_state"));
+    }
+
+    #[test]
+    fn api_errors_classify_401_and_429() {
+        let err = |status: u16, retry: Option<u64>| -> anyhow::Error {
+            anyhow::Error::from(ApiError {
+                label: "GET /api/1/vehicles".into(),
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                retry_after: retry.map(std::time::Duration::from_secs),
+            })
+            .context("car 1")
+        };
+        assert!(is_unauthorized(&err(401, None)));
+        assert!(!is_unauthorized(&err(408, None)));
+        assert_eq!(rate_limited_for(&err(408, None)), None);
+        assert_eq!(rate_limited_for(&err(429, Some(90))), Some(std::time::Duration::from_secs(90)));
+        assert_eq!(rate_limited_for(&err(429, None)), Some(RATE_LIMIT_DEFAULT));
+        assert_eq!(rate_limited_for(&err(429, Some(86_400))), Some(RATE_LIMIT_MAX));
+        assert!(!is_unauthorized(&anyhow::anyhow!("decode")));
     }
 
     #[test]

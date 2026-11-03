@@ -227,9 +227,19 @@ async fn poll_due(
                 }
             }
             Err(e) => {
-                warn!("car {}: {e:#}", car.id);
+                let normal = Duration::from_secs(poll_secs().max(1));
+                let wait = match tesla::rate_limited_for(&e) {
+                    Some(asked) => {
+                        warn!("car {}: rate limited by Tesla; waiting {}s", car.id, asked.as_secs());
+                        asked.max(normal)
+                    }
+                    None => {
+                        warn!("car {}: {e:#}", car.id);
+                        normal
+                    }
+                };
                 if let Some(entry) = tracked.get_mut(&car.id) {
-                    entry.next_poll = Instant::now() + Duration::from_secs(poll_secs().max(1));
+                    entry.next_poll = Instant::now() + wait;
                 }
             }
         }
@@ -475,6 +485,11 @@ fn sync_updates(conn: &Connection, car_id: i64, data: &Value, now: &str) -> Resu
     Ok(Some(version.to_string()))
 }
 
+/// Owner API and stream speeds are mph; `positions.speed` is km/h as in TeslaMate.
+fn mph_to_kmh(mph: f64) -> i64 {
+    (mph * 1.60934).round() as i64
+}
+
 fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     let lat = tesla::f64_field(data, &["drive_state", "latitude"]).unwrap_or(0.0);
@@ -494,7 +509,7 @@ fn persist_snapshot(db: &Db, car_id: i64, data: &Value) -> Result<i64> {
             now,
             lat,
             lon,
-            tesla::i64_field(data, &["drive_state", "speed"]),
+            tesla::f64_field(data, &["drive_state", "speed"]).map(mph_to_kmh),
             tesla::i64_field(data, &["drive_state", "power"]),
             tesla::f64_field(data, &["vehicle_state", "odometer"]).map(|m| m * 1.60934),
             tesla::f64_field(data, &["charge_state", "ideal_battery_range"]).map(|m| m * 1.60934),
@@ -1221,7 +1236,7 @@ fn ingest_stream_row(db: &Db, car_id: i64, csv: &str) -> Result<()> {
     if cols.len() < 8 {
         return Ok(());
     }
-    let speed: Option<i64> = cols[0].parse().ok();
+    let speed: Option<i64> = cols[0].parse::<f64>().ok().map(mph_to_kmh);
     let odo_mi: Option<f64> = cols[1].parse().ok();
     let soc: Option<i64> = cols[2].parse().ok();
     let elev: Option<i64> = cols[3].parse().ok();
@@ -1382,6 +1397,28 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn positions_store_speed_in_kmh() {
+        let db = Db::from_write(memory());
+        let data = json!({
+            "drive_state": {"speed": 30, "latitude": 52.2, "longitude": 0.1, "power": 12},
+            "charge_state": {"battery_level": 60},
+        });
+        ingest_stream_row(&db, 1, "70,100000.0,60,20,90,52.3,0.2,40,D,200,190,90").unwrap();
+        persist_snapshot(&db, 1, &data).unwrap();
+        let speeds: Vec<i64> = {
+            let conn = db.lock();
+            let mut stmt = conn.prepare("SELECT speed FROM positions ORDER BY id").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(speeds, vec![113, 48]);
     }
 
     fn position(
